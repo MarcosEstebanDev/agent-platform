@@ -49,12 +49,15 @@ y el sandbox no se tocan.
 | **0a** | Sandbox Docker aislado, con exec / write / read | ✅ verificado |
 | **0b** | Loop de agente cerrando una tarea end-to-end | ✅ verificado |
 | **1** | Orquestador NestJS: ticket + máquina de estados + traza | ✅ verificado |
-| 1b | BullMQ: ejecución asíncrona con reintentos y DLQ | ⬜ |
-| 2 | Rama por ticket + PR | ⬜ |
-| 3 | Gate de CI antes del merge | ⬜ |
+| **—** | Tests del dominio (20) + ADRs + specs | ✅ |
+| 1b | Async, reintentos, reaper y presupuestos — [spec 002](docs/specs/002-ejecucion-asincrona.md) | 📄 especificada |
+| 2 | Ramas y pull requests — [spec 003](docs/specs/003-pull-requests.md) | 📄 especificada |
+| 3 | Gates de calidad — [spec 004](docs/specs/004-gates-de-calidad.md) | 📄 especificada |
 | 4 | Multiagente: Tech Lead → Developer / Reviewer / QA | ⬜ |
 | 5 | Rúbricas = criterios de aceptación ejecutables | ⬜ |
-| 6 | SonarCloud, Jira, deploy con aprobación humana | ⬜ |
+| 6 | Despliegue — [spec 005](docs/specs/005-despliegue.md) | 📄 especificada |
+
+📄 = diseñada y documentada con criterio de aceptación, sin implementar.
 
 ## Arranque
 
@@ -62,6 +65,7 @@ Requiere **Docker Desktop corriendo** y Node 22+.
 
 ```bash
 npm install
+npm test             # 20 tests del dominio — sin base, sin Docker, sin LLM
 npm run smoke        # verifica el sandbox — no necesita ninguna key
 
 cp .env.example .env # completar LLM_API_KEY
@@ -114,44 +118,35 @@ US$0 con free tier. Docker corre local.
 El límite que muerde en un loop agéntico no es el de tokens sino el de
 **requests por minuto**: cada tarea dispara una llamada por iteración.
 
-## Decisiones
+## Tests
 
-**Puertos antes que adapters.** El `LlmPort` existe desde el primer día aunque
-haya un solo adapter. No es sobreingeniería preventiva: durante la construcción
-de este MVP, GitHub Models (el proveedor elegido originalmente) resultó estar
-retirado desde el 30/07/2026 y devolvía `410`. Cambiar de proveedor costó un
-archivo; el loop del agente y el sandbox no se tocaron.
+```bash
+npm test        # 20 tests, ~700 ms
+```
 
-**La base URL es un dato, no una constante.** Los proveedores gratis aparecen y
-desaparecen. Por eso el adapter es genérico OpenAI-compatible y el proveedor
-vive en el `.env`.
+Corren **sin base de datos, sin Docker y sin LLM**: la lógica de orquestación se
+verifica contra dobles de prueba. Ese es el retorno concreto de la arquitectura
+hexagonal, y la razón por la que los puertos valen su indirección.
 
-**El sandbox es la única frontera.** Todo lo que el agente ejecuta pasa por
-`SandboxPort`. Nada corre en la shell del host: siempre `execFile` con args en
-array, nunca interpolación de strings en un shell local.
+- `src/domain/ticket.test.ts` — la máquina de estados, verificada de forma
+  exhaustiva sobre todo el producto cartesiano de estados.
+- `src/application/run-ticket.use-case.test.ts` — la orquestación: carreras
+  entre workers, fallos del LLM, limpieza del sandbox, tolerancia del log.
 
-**Defaults restrictivos.** El container arranca sin red (`--network none`),
-con memoria y CPU acotadas y timeout por comando. Para `npm install` hay que
-poner `SANDBOX_NETWORK=bridge` — explícitamente, entendiendo el riesgo.
+## Documentación
 
-**Los errores de tool no rompen el loop.** Se devuelven al modelo como texto
-para que corrija el rumbo. Un `throw` mataría la corrida por un typo en un comando.
+Las decisiones y el comportamiento están en **[`docs/`](docs/README.md)**:
 
-**El agente propone, la máquina de estados dispone.** Ninguna transición ocurre
-porque el modelo diga que terminó: ocurre porque el orquestador la autorizó.
-Hoy el veredicto todavía sale del autoreporte del agente (fase 1); desde la
-fase 3 sale de los checks del PR — señal determinística.
+- **[ADR](docs/README.md#decisiones-adr)** — por qué cada cosa es como es.
+  Arquitectura hexagonal, proveedor agnóstico, el sandbox como única frontera,
+  lista blanca de transiciones, compare-and-set, traza append-only, y por qué
+  el veredicto no lo da el agente.
+- **[Specs](docs/README.md#comportamiento-spec)** — qué tiene que pasar, esté
+  implementado o no. Incluye el diseño completo de PRs, gates de calidad y
+  despliegue, que todavía no están construidos.
 
-**El claim del ticket es un compare-and-set.** `UPDATE ... WHERE id = $1 AND
-status = $2` en una sola sentencia. Un `findById` seguido de `update` sería una
-condición de carrera: dos workers podrían leer `ASSIGNED` a la vez y ambos
-creerse dueños del ticket.
-
-**La corrida se cierra siempre, aunque el agente explote.** Un ticket colgado
-en `IN_PROGRESS` para siempre es peor que uno fallado.
-
-**Persistir un evento no puede matar la corrida.** El log de auditoría es
-best-effort: si falla el `INSERT`, el trabajo del agente sigue siendo válido.
+Si vas a implementar la fase siguiente, la spec correspondiente tiene el
+criterio de aceptación al final.
 
 **El deploy no se le da al agente.** Es difícil de revertir: lo dispara la
 máquina de estados cuando pasan los gates.

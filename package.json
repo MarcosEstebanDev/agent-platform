@@ -14,7 +14,8 @@
     "models": "tsx --env-file=.env src/models.ts",
     "run": "tsx --env-file=.env src/run.ts",
     "api": "tsx --env-file=.env src/api/main.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test src/domain/*.test.ts src/application/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",
