@@ -1,0 +1,74 @@
+// Prisma 7: `prisma-client` (ESM) reemplaza a `prisma-client-js`,
+// y hay que declarar el output explícitamente.
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+// La URL de conexión vive en prisma.config.ts: desde Prisma 7 el schema
+// ya no acepta `url` en el datasource.
+datasource db {
+  provider = "postgresql"
+}
+
+enum TicketStatus {
+  BACKLOG
+  ASSIGNED
+  IN_PROGRESS
+  DONE
+  FAILED
+}
+
+model Ticket {
+  id        String       @id @default(uuid())
+  title     String
+  /// La instrucción que recibe el agente.
+  task      String
+  status    TicketStatus @default(BACKLOG)
+  createdAt DateTime     @default(now()) @map("created_at")
+  updatedAt DateTime     @updatedAt @map("updated_at")
+
+  runs AgentRun[]
+
+  @@index([status])
+  @@map("tickets")
+}
+
+/// Una ejecución del agente sobre un ticket. Un ticket puede tener varias
+/// (reintentos, cambios pedidos en review).
+model AgentRun {
+  id           String    @id @default(uuid())
+  ticketId     String    @map("ticket_id")
+  ticket       Ticket    @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  model        String
+  startedAt    DateTime  @default(now()) @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  /// completed | max_iterations | error
+  outcome      String?
+  iterations   Int       @default(0)
+  inputTokens  Int       @default(0) @map("input_tokens")
+  outputTokens Int       @default(0) @map("output_tokens")
+  error        String?
+
+  events AgentEvent[]
+
+  @@index([ticketId])
+  @@map("agent_runs")
+}
+
+/// Log append-only de lo que hizo el agente. Es la traza de auditoría:
+/// qué comando corrió, qué archivo tocó, qué devolvió.
+model AgentEvent {
+  id      String   @id @default(uuid())
+  runId   String   @map("run_id")
+  run     AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  /// Orden dentro de la corrida. La marca de tiempo no alcanza: varios
+  /// eventos pueden caer en el mismo milisegundo.
+  seq     Int
+  type    String
+  payload Json
+  at      DateTime @default(now())
+
+  @@unique([runId, seq])
+  @@map("agent_events")
+}

@@ -15,14 +15,26 @@ src/
 │   │   ├── llm.port.ts        "completá con estas tools"
 │   │   └── sandbox.port.ts    "ejecutá esto de forma aislada"
 │   └── agent-runner.ts        el loop del agente
+│   ├── ticket.ts              máquina de estados (lista blanca de transiciones)
+│   └── ports/
+│       ├── ticket-repository.port.ts
+│       └── sandbox-factory.port.ts
+├── application/
+│   └── run-ticket.use-case.ts  orquesta: claim → agente → traza → veredicto
 ├── infrastructure/
 │   ├── llm/
 │   │   └── openai-compatible.adapter.ts   cualquier proveedor OpenAI-compatible
+│   ├── persistence/
+│   │   ├── prisma-client.factory.ts       driver adapter (Prisma 7)
+│   │   └── prisma-ticket.repository.ts
 │   └── sandbox/
-│       └── docker.sandbox.ts              Docker local
-├── run.ts                     composition root
+│       ├── docker.sandbox.ts              Docker local
+│       └── docker-sandbox.factory.ts      un container por corrida
+├── api/                       NestJS: controller + composition root
+├── run.ts                     agente suelto, sin persistencia
 ├── models.ts                  lista los modelos que habilita tu API key
-└── smoke.ts                   verifica el sandbox sin usar el LLM
+├── smoke.ts                   verifica el sandbox sin usar el LLM
+└── db-smoke.ts                verifica la persistencia sin usar el LLM
 
 reference/managed-agents/      Managed Agents de Anthropic (requiere API key)
 ```
@@ -36,7 +48,8 @@ y el sandbox no se tocan.
 |---|---|---|
 | **0a** | Sandbox Docker aislado, con exec / write / read | ✅ verificado |
 | **0b** | Loop de agente cerrando una tarea end-to-end | ✅ verificado |
-| 1 | Orquestador NestJS: ticket + máquina de estados | ⬜ |
+| **1** | Orquestador NestJS: ticket + máquina de estados + traza | ✅ verificado |
+| 1b | BullMQ: ejecución asíncrona con reintentos y DLQ | ⬜ |
 | 2 | Rama por ticket + PR | ⬜ |
 | 3 | Gate de CI antes del merge | ⬜ |
 | 4 | Multiagente: Tech Lead → Developer / Reviewer / QA | ⬜ |
@@ -53,9 +66,42 @@ npm run smoke        # verifica el sandbox — no necesita ninguna key
 
 cp .env.example .env # completar LLM_API_KEY
 npm run models       # lista los modelos que tu key habilita
+
+# Agente suelto, sin persistencia
 npm run run
 npm run run "tu tarea acá"
+
+# Plataforma completa
+npm run db:up        # Postgres en Docker
+npm run db:migrate   # migraciones + regenera el cliente Prisma
+npm run api          # http://localhost:3000
 ```
+
+### API
+
+```bash
+# crear
+curl -X POST localhost:3000/tickets -H "content-type: application/json" \
+  -d '{"title":"Sumar","task":"Crea sum.mjs con tests y corré node --test"}'
+
+# ejecutar (síncrono: espera a que el agente termine)
+curl -X POST localhost:3000/tickets/<id>/run
+
+# consultar
+curl localhost:3000/tickets
+curl localhost:3000/tickets?status=DONE
+```
+
+### Máquina de estados
+
+```
+BACKLOG → ASSIGNED → IN_PROGRESS → DONE
+             ↑            ↓
+             └───────── FAILED
+```
+
+Lista blanca de transiciones: todo lo que no esté declarado está prohibido.
+Ejecutar un ticket que ya está en `DONE` devuelve `409`.
 
 La key por defecto es de **Groq** (free tier, sin tarjeta):
 [console.groq.com/keys](https://console.groq.com/keys). Cualquier proveedor
@@ -91,9 +137,21 @@ poner `SANDBOX_NETWORK=bridge` — explícitamente, entendiendo el riesgo.
 **Los errores de tool no rompen el loop.** Se devuelven al modelo como texto
 para que corrija el rumbo. Un `throw` mataría la corrida por un typo en un comando.
 
-**El agente ejecuta los tests, pero no los evalúa.** Hoy los corre para
-autoverificarse. Desde la fase 3, el veredicto que autoriza el merge lo lee el
-orquestador de los checks del PR — señal determinística, no autoreporte.
+**El agente propone, la máquina de estados dispone.** Ninguna transición ocurre
+porque el modelo diga que terminó: ocurre porque el orquestador la autorizó.
+Hoy el veredicto todavía sale del autoreporte del agente (fase 1); desde la
+fase 3 sale de los checks del PR — señal determinística.
+
+**El claim del ticket es un compare-and-set.** `UPDATE ... WHERE id = $1 AND
+status = $2` en una sola sentencia. Un `findById` seguido de `update` sería una
+condición de carrera: dos workers podrían leer `ASSIGNED` a la vez y ambos
+creerse dueños del ticket.
+
+**La corrida se cierra siempre, aunque el agente explote.** Un ticket colgado
+en `IN_PROGRESS` para siempre es peor que uno fallado.
+
+**Persistir un evento no puede matar la corrida.** El log de auditoría es
+best-effort: si falla el `INSERT`, el trabajo del agente sigue siendo válido.
 
 **El deploy no se le da al agente.** Es difícil de revertir: lo dispara la
 máquina de estados cuando pasan los gates.

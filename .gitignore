@@ -1,3 +1,6 @@
 node_modules/
 .env
 *.log
+
+# Cliente de Prisma: se regenera con `prisma generate` (postinstall)
+src/generated/
