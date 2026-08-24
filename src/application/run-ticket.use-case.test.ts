@@ -19,10 +19,13 @@ import { RunTicketUseCase } from './run-ticket.use-case.js';
  * milisegundos, contra dobles de prueba.
  */
 
-function build(scripted: Array<LlmResponse | Error>) {
+function build(
+  scripted: Array<LlmResponse | Error>,
+  prepare?: (sandbox: FakeSandbox) => void,
+) {
   const tickets = new FakeTicketRepository();
   const llm = new FakeLlm(scripted);
-  const sandboxes = new FakeSandboxFactory();
+  const sandboxes = new FakeSandboxFactory(prepare);
   return {
     tickets,
     llm,
@@ -57,7 +60,12 @@ test('persiste la traza completa, en orden y sin huecos', async () => {
   const tipos = tickets.events.map((e) => e.event.type);
   assert.ok(tipos.includes('tool_call'));
   assert.ok(tipos.includes('tool_result'));
-  assert.equal(tipos.at(-1), 'done');
+
+  // La traza mezcla dos emisores: el agente termina con 'done', y despues el
+  // orquestador anota que rescato del sandbox. Por eso 'done' es el ultimo
+  // evento DEL AGENTE, no el ultimo de la traza.
+  assert.equal(tipos.at(-1), 'artifact', 'el rescate se anota despues del done');
+  assert.equal(tipos.at(-2), 'done');
 });
 
 test('cierra la corrida con el resumen', async () => {
@@ -275,9 +283,143 @@ test('el ultimo evento persistido dice por que se corto', async () => {
 
   await useCase.execute('T-1');
 
-  const ultimo = tickets.events.at(-1)!.event;
-  assert.equal(ultimo.type, 'done');
-  if (ultimo.type !== 'done') return;
-  assert.equal(ultimo.reason, 'budget_exceeded');
-  assert.equal(ultimo.budget, 'tokens');
+  const done = tickets.events.map((e) => e.event).findLast((e) => e.type === 'done');
+  assert.ok(done, 'la traza tiene que decir por que se corto');
+  if (done.type !== 'done') return;
+  assert.equal(done.reason, 'budget_exceeded');
+  assert.equal(done.budget, 'tokens');
+});
+
+// ─── Rescate del trabajo ────────────────────────────────────────────────────
+//
+// `stop()` es irreversible: lo que el agente escribio solo existe dentro del
+// container. Si no se saca antes de apagarlo, no hay nada que poner en un PR.
+
+test('extrae el trabajo ANTES de destruir el sandbox', async () => {
+  const { tickets, sandboxes, useCase } = build(
+    [textResponse('listo')],
+    (sandbox) => {
+      sandbox.files = [{ path: 'sum.mjs', content: 'export const sum = 1;', bytes: 21 }];
+    },
+  );
+  tickets.seed('BACKLOG');
+
+  await useCase.execute('T-1');
+
+  const sandbox = sandboxes.created[0]!;
+  assert.equal(sandbox.stopped, 1, 'el sandbox igual se destruye');
+  // Lo que se verifica no es que ambos hayan pasado, sino el ORDEN: si el
+  // rescate ocurriera despues del stop(), el workspace ya no existiria.
+  assert.equal(sandbox.stoppedAtExport, 0, 'se exporto con el sandbox todavia vivo');
+});
+
+test('persiste lo que el agente dejo en el workspace', async () => {
+  const { tickets, useCase } = build([textResponse('listo')], (sandbox) => {
+    sandbox.files = [
+      { path: 'sum.mjs', content: 'export const sum = (a, b) => a + b;', bytes: 34 },
+      { path: 'sum.test.mjs', content: 'import { sum }', bytes: 14 },
+    ];
+  });
+  tickets.seed('BACKLOG');
+
+  const result = await useCase.execute('T-1');
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  assert.equal(result.artifact.files, 2);
+  assert.equal(result.artifact.bytes, 48);
+
+  const guardado = await tickets.getRunArtifact(result.runId);
+  assert.ok(guardado, 'el artefacto tiene que sobrevivir a la corrida');
+  assert.deepEqual(
+    guardado.files.map((f) => f.path),
+    ['sum.mjs', 'sum.test.mjs'],
+  );
+});
+
+test('el rescate queda en la traza, para explicar un PR vacio', async () => {
+  const { tickets, useCase } = build([textResponse('listo')], (sandbox) => {
+    sandbox.files = [{ path: 'a.txt', content: 'hola', bytes: 4 }];
+  });
+  tickets.seed('BACKLOG');
+
+  await useCase.execute('T-1');
+
+  const evento = tickets.events.map((e) => e.event).findLast((e) => e.type === 'artifact');
+  assert.ok(evento);
+  if (evento.type !== 'artifact') return;
+  assert.equal(evento.files, 1);
+  assert.equal(evento.bytes, 4);
+});
+
+test('un rescate fallido NO convierte una corrida exitosa en falla', async () => {
+  const { tickets, useCase } = build([textResponse('listo')], (sandbox) => {
+    sandbox.exportFails = new Error('docker exec murio');
+  });
+  tickets.seed('BACKLOG');
+
+  const result = await useCase.execute('T-1');
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  // El agente resolvio la tarea: que falle sacar los archivos no invalida
+  // lo que hizo.
+  assert.equal(result.ticket.status, 'DONE');
+  assert.equal(result.summary.outcome, 'completed');
+  // Pero tampoco se calla: un PR vacio sin explicacion es peor que uno que
+  // dice por que esta vacio.
+  assert.match(result.artifact.error ?? '', /docker exec murio/);
+});
+
+test('un rescate fallido queda registrado en la traza', async () => {
+  const { tickets, useCase } = build([textResponse('listo')], (sandbox) => {
+    sandbox.exportFails = new Error('sin espacio');
+  });
+  tickets.seed('BACKLOG');
+
+  await useCase.execute('T-1');
+
+  const evento = tickets.events.map((e) => e.event).findLast((e) => e.type === 'artifact');
+  assert.ok(evento);
+  if (evento.type !== 'artifact') return;
+  assert.match(evento.error ?? '', /sin espacio/);
+});
+
+test('si el sandbox nunca arranco, no se intenta rescatar nada', async () => {
+  const tickets = new FakeTicketRepository();
+  tickets.seed('BACKLOG');
+  const sandboxes = new FakeSandboxFactory();
+  // Un sandbox que no levanta: el error real es ese, y no debe quedar tapado
+  // por un "el sandbox no esta iniciado" que vendria del rescate.
+  sandboxes.create = () => {
+    const sandbox = new FakeSandbox();
+    sandbox.start = () => Promise.reject(new Error('Docker no responde'));
+    sandboxes.created.push(sandbox);
+    return sandbox;
+  };
+
+  const result = await new RunTicketUseCase(
+    tickets,
+    new FakeLlm([textResponse('listo')]),
+    sandboxes,
+  ).execute('T-1');
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.summary.outcome, 'error');
+  assert.match(result.summary.error ?? '', /Docker no responde/);
+  assert.equal(sandboxes.created[0]!.filesAtExport, null, 'no se intento exportar');
+});
+
+test('el sandbox se crea con el id de la corrida', async () => {
+  const { tickets, sandboxes, useCase } = build([textResponse('listo')]);
+  tickets.seed('BACKLOG');
+
+  const result = await useCase.execute('T-1');
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+
+  // Sin esta identidad, un container que sobrevive a su worker es
+  // indistinguible de uno que esta trabajando.
+  assert.equal(sandboxes.contexts[0]!.runId, result.runId);
 });

@@ -1,7 +1,27 @@
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomUUID } from 'node:crypto';
-import type { ExecResult, SandboxPort } from '../../domain/ports/sandbox.port.js';
+import type {
+  ExecResult,
+  ExportOptions,
+  SandboxPort,
+  SkippedFile,
+  WorkspaceExport,
+  WorkspaceFile,
+} from '../../domain/ports/sandbox.port.js';
+
+/**
+ * Label que marca un container como nuestro y dice de qué corrida es.
+ *
+ * Es la identidad que permite limpiar huérfanos sin adivinar: filtrar por
+ * nombre (`agent-sbx-*`) alcanzaría para encontrarlos, pero no para saber
+ * cuáles siguen trabajando.
+ */
+export const RUN_LABEL = 'agent-platform.run';
+
+/** Directorios que nunca son "el trabajo del agente": se podan por nombre, a
+ *  cualquier profundidad. */
+const DEFAULT_EXCLUDE = ['node_modules', '.git', 'dist', '.next'];
 
 const run = promisify(execFile);
 
@@ -14,6 +34,15 @@ export interface DockerSandboxOptions {
   cpus?: string;
   /** Timeout por comando, en milisegundos. */
   timeoutMs?: number;
+  /**
+   * Corrida dueña del container. Se escribe como label.
+   *
+   * Sin runId el container NO se etiqueta, y por lo tanto es invisible para
+   * el barrido de huérfanos. Es deliberado: un sandbox suelto (`npm run run`)
+   * no tiene fila en `agent_runs`, así que nadie puede decidir si sigue
+   * trabajando — y lo que la base no puede juzgar, no se barre.
+   */
+  runId?: string;
 }
 
 /**
@@ -28,7 +57,9 @@ export interface DockerSandboxOptions {
  */
 export class DockerSandbox implements SandboxPort {
   private containerId: string | null = null;
-  private readonly opts: Required<DockerSandboxOptions>;
+  private readonly opts: Omit<Required<DockerSandboxOptions>, 'runId'> & {
+    runId?: string;
+  };
 
   constructor(options: DockerSandboxOptions = {}) {
     this.opts = {
@@ -37,6 +68,7 @@ export class DockerSandbox implements SandboxPort {
       memory: options.memory ?? '2g',
       cpus: options.cpus ?? '2',
       timeoutMs: options.timeoutMs ?? 120_000,
+      runId: options.runId,
     };
   }
 
@@ -59,6 +91,7 @@ export class DockerSandbox implements SandboxPort {
       [
         'run', '-d', '--rm',
         '--name', name,
+        ...(this.opts.runId ? ['--label', `${RUN_LABEL}=${this.opts.runId}`] : []),
         '--network', this.opts.network,
         '--memory', this.opts.memory,
         '--cpus', this.opts.cpus,
@@ -132,6 +165,29 @@ export class DockerSandbox implements SandboxPort {
     return result.stdout;
   }
 
+  /**
+   * Saca el trabajo del sandbox antes de destruirlo.
+   *
+   * El container emite una línea por archivo con la forma
+   * `<ruta-b64> <bytes> <estado> [contenido-b64]`. La ruta y el contenido van
+   * en base64 no por gusto: una ruta con espacios, comillas o un salto de
+   * línea rompe cualquier parseo por delimitador, y un archivo con comillas
+   * adentro rompe el JSON armado a mano en bash. En base64 no existen
+   * caracteres conflictivos, así que el escapeo deja de ser una categoría
+   * de bug.
+   *
+   * Los techos se aplican DENTRO del shell. Si se filtraran del lado de Node,
+   * los cientos de megas ya habrían viajado por el pipe y reventado el
+   * `maxBuffer` de execFile antes de que nadie pudiera descartarlos.
+   */
+  async exportFiles(options: ExportOptions = {}): Promise<WorkspaceExport> {
+    const result = await this.exec(buildExportScript(options));
+    if (result.exitCode !== 0) {
+      throw new Error(`No se pudo exportar el workspace: ${result.stderr}`);
+    }
+    return parseExportOutput(result.stdout);
+  }
+
   async stop(): Promise<void> {
     if (!this.containerId) return;
     const id = this.containerId;
@@ -149,4 +205,107 @@ export class DockerSandbox implements SandboxPort {
     }
     return this.containerId;
   }
+}
+
+/**
+ * El script que corre DENTRO del container para sacar el workspace.
+ *
+ * Emite una linea por archivo: `<ruta-b64> <bytes> <estado> [contenido-b64]`.
+ *
+ * La ruta y el contenido van en base64 no por gusto: una ruta con espacios,
+ * comillas o un salto de linea rompe cualquier parseo por delimitador, y un
+ * archivo que contenga comillas rompe el JSON armado a mano en bash. En base64
+ * no existen caracteres conflictivos, asi que el escapeo deja de ser una
+ * categoria de bug.
+ *
+ * Los techos se aplican ACA, dentro del shell. Filtrar del lado de Node
+ * llegaria tarde: los cientos de megas ya habrian viajado por el pipe y
+ * reventado el `maxBuffer` de execFile antes de que nadie pudiera
+ * descartarlos.
+ *
+ * Se exporta para poder verificarlo contra un bash real, sin Docker.
+ */
+export function buildExportScript(options: ExportOptions = {}, root = '/workspace'): string {
+  const maxFileBytes = options.maxFileBytes ?? 512 * 1024;
+  const maxTotalBytes = options.maxTotalBytes ?? 4 * 1024 * 1024;
+  const exclude = options.exclude ?? DEFAULT_EXCLUDE;
+
+  // Se poda por NOMBRE de directorio, no por ruta: `-path './node_modules/*'`
+  // solo alcanzaria al de la raiz y dejaria entrar los anidados, que es
+  // exactamente donde vive el peso.
+  //
+  // Los patrones vienen de configuracion y no del agente, pero igual se
+  // sanean: cualquier cosa fuera de este alfabeto podria cerrar la comilla y
+  // seguir escribiendo shell.
+  const pruned = exclude
+    .map((name) => name.replace(/[^A-Za-z0-9._-]/g, ''))
+    .filter(Boolean)
+    .map((name) => `-name '${name}' -prune -o`)
+    .join(' ');
+
+  return `
+    cd ${root} 2>/dev/null || exit 0
+    total=0
+    find . ${pruned} -type f -print0 2>/dev/null | while IFS= read -r -d '' f; do
+      sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+      p64=$(printf %s "\${f#./}" | base64 -w0)
+      if [ "$sz" -gt ${maxFileBytes} ]; then
+        echo "$p64 $sz too_large"
+      elif [ $((total + sz)) -gt ${maxTotalBytes} ]; then
+        echo "$p64 $sz budget"
+      else
+        total=$((total + sz))
+        echo "$p64 $sz ok $(base64 -w0 < "$f")"
+      fi
+    done
+  `;
+}
+
+/**
+ * Convierte la salida del script en el resultado del puerto.
+ *
+ * Es una funcion pura a proposito: el riesgo real de la extraccion son las
+ * rutas raras (comillas, espacios, acentos, saltos de linea) y los archivos
+ * binarios, y todo eso se puede verificar sin container, sin bash y sin
+ * sistema de archivos.
+ *
+ * Detalle conocido: un binario CONSUME presupuesto aunque despues se descarte,
+ * porque el shell cuenta los bytes y la deteccion pasa aca. Detectarlo del
+ * lado del container costaria una pasada extra por archivo; se prefiere que un
+ * workspace lleno de binarios rinda menos texto antes que encarecer el caso
+ * normal.
+ */
+export function parseExportOutput(stdout: string): WorkspaceExport {
+  const files: WorkspaceFile[] = [];
+  const skipped: SkippedFile[] = [];
+  let totalBytes = 0;
+
+  for (const line of stdout.split('\n')) {
+    if (!line.trim()) continue;
+    const [p64, rawSize, state, body] = line.trim().split(' ');
+    if (!p64 || !state) continue;
+
+    const path = Buffer.from(p64, 'base64').toString('utf8');
+    const bytes = Number.parseInt(rawSize ?? '0', 10) || 0;
+
+    if (state === 'too_large' || state === 'budget') {
+      skipped.push({ path, bytes, reason: state });
+      continue;
+    }
+    if (state !== 'ok') continue;
+
+    const buf = Buffer.from(body ?? '', 'base64');
+    // Un byte nulo significa binario. Guardarlo como texto lo corromperia en
+    // silencio, que es peor que decir que no vino.
+    if (buf.includes(0)) {
+      skipped.push({ path, bytes, reason: 'binary' });
+      continue;
+    }
+
+    files.push({ path, content: buf.toString('utf8'), bytes });
+    totalBytes += bytes;
+  }
+
+  files.sort((a, b) => a.path.localeCompare(b.path));
+  return { files, skipped, totalBytes, truncated: skipped.length > 0 };
 }

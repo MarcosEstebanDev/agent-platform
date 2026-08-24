@@ -22,6 +22,21 @@ export type AgentEvent =
       reason: AgentStopReason;
       /** Cual de los tres presupuestos se agoto. Solo en 'budget_exceeded'. */
       budget?: ExceededBudget;
+    }
+  /**
+   * Rescate del trabajo antes de destruir el sandbox.
+   *
+   * Lo emite el caso de uso, no el agente: el agente no sabe que su entorno
+   * es efimero. Vive igual en la traza porque "que sobrevivio de esta
+   * corrida" es parte de su historia, y es lo unico que explica un PR vacio.
+   */
+  | {
+      type: 'artifact';
+      files: number;
+      bytes: number;
+      truncated: boolean;
+      /** Presente solo si la extraccion fallo. La corrida no se cae por esto. */
+      error?: string;
     };
 
 export type AgentStopReason = 'completed' | 'max_iterations' | 'budget_exceeded';

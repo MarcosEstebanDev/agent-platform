@@ -97,14 +97,7 @@ export class TicketsController {
     @Query('after') after?: string,
     @Query('limit') limit?: string,
   ) {
-    await this.requireTicket(id);
-
-    // Sin esta verificacion, /tickets/A/runs/<run-de-B>/events devolveria la
-    // traza de B. La ruta anidada tiene que significar lo que promete.
-    const runs = await this.tickets.listRuns(id);
-    if (!runs.some((r) => r.id === runId)) {
-      throw new NotFoundException(`La corrida ${runId} no pertenece al ticket ${id}`);
-    }
+    await this.requireRun(id, runId);
 
     return this.tickets.listEvents(runId, {
       after: parsePositiveInt(after, 'after'),
@@ -112,10 +105,45 @@ export class TicketsController {
     });
   }
 
+  /**
+   * El trabajo que sobrevivio al sandbox.
+   *
+   * Va aparte de `/runs` y no embebido en el: el listado de corridas lo pide
+   * el tablero todo el tiempo, y arrastrar el contenido de los archivos en
+   * cada refresco convierte la lectura mas frecuente en la mas cara.
+   */
+  @Get(':id/runs/:runId/artifact')
+  async artifact(@Param('id') id: string, @Param('runId') runId: string) {
+    await this.requireRun(id, runId);
+
+    const artifact = await this.tickets.getRunArtifact(runId);
+    if (!artifact) {
+      throw new NotFoundException(
+        `La corrida ${runId} no tiene trabajo rescatado. ` +
+          'O no llego a arrancar el sandbox, o la extraccion fallo (mira la traza).',
+      );
+    }
+    return artifact;
+  }
+
   private async requireTicket(id: string) {
     const ticket = await this.tickets.findById(id);
     if (!ticket) throw new NotFoundException(`No existe el ticket ${id}`);
     return ticket;
+  }
+
+  /**
+   * La corrida existe Y pertenece al ticket de la ruta.
+   *
+   * Sin la segunda mitad, /tickets/A/runs/<run-de-B>/events devolveria la
+   * traza de B: la ruta anidada tiene que significar lo que promete.
+   */
+  private async requireRun(ticketId: string, runId: string) {
+    await this.requireTicket(ticketId);
+    const runs = await this.tickets.listRuns(ticketId);
+    if (!runs.some((r) => r.id === runId)) {
+      throw new NotFoundException(`La corrida ${runId} no pertenece al ticket ${ticketId}`);
+    }
   }
 }
 

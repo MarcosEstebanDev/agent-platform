@@ -1,13 +1,27 @@
 import type { AgentEvent } from '../domain/agent-runner.js';
 import type { LlmPort, LlmResponse } from '../domain/ports/llm.port.js';
 import { QueueUnavailableError, type QueuePort } from '../domain/ports/queue.port.js';
-import type { SandboxFactoryPort } from '../domain/ports/sandbox-factory.port.js';
-import type { ExecResult, SandboxPort } from '../domain/ports/sandbox.port.js';
+import type {
+  SandboxContext,
+  SandboxFactoryPort,
+} from '../domain/ports/sandbox-factory.port.js';
+import type {
+  ManagedSandbox,
+  SandboxJanitorPort,
+} from '../domain/ports/sandbox-janitor.port.js';
+import type {
+  ExecResult,
+  ExportOptions,
+  SandboxPort,
+  WorkspaceExport,
+  WorkspaceFile,
+} from '../domain/ports/sandbox.port.js';
 import type {
   AgentEventRecord,
   AgentRunRecord,
   AgentRunSummary,
   StaleRun,
+  StoredArtifact,
   TicketRepositoryPort,
 } from '../domain/ports/ticket-repository.port.js';
 import { assertTransition, type Ticket, type TicketStatus } from '../domain/ticket.js';
@@ -32,6 +46,7 @@ interface FakeRun {
 }
 
 export class FakeTicketRepository implements TicketRepositoryPort {
+  readonly artifacts = new Map<string, StoredArtifact>();
   private readonly tickets = new Map<string, Ticket>();
   private readonly runs = new Map<string, FakeRun>();
   readonly events: Array<{ runId: string; seq: number; event: AgentEvent }> = [];
@@ -158,6 +173,25 @@ export class FakeTicketRepository implements TicketRepositoryPort {
       }));
   }
 
+  async findOpenRunIds(runIds: string[]): Promise<string[]> {
+    return [...this.runs.values()]
+      .filter((r) => runIds.includes(r.id) && r.finishedAt === null)
+      .map((r) => r.id);
+  }
+
+  async saveRunArtifact(runId: string, artifact: WorkspaceExport): Promise<void> {
+    // Igual que el repo real: upsert por runId, no acumulacion.
+    this.artifacts.set(runId, {
+      ...artifact,
+      runId,
+      createdAt: new Date(this.now()),
+    });
+  }
+
+  async getRunArtifact(runId: string): Promise<StoredArtifact | null> {
+    return this.artifacts.get(runId) ?? null;
+  }
+
   async listEvents(
     runId: string,
     options: { after?: number; limit?: number } = {},
@@ -204,6 +238,15 @@ export class FakeSandbox implements SandboxPort {
   stopped = 0;
   readonly commands: string[] = [];
 
+  /** Lo que "escribio el agente". El test lo configura antes de correr. */
+  files: WorkspaceFile[] = [];
+  /** Para probar que un rescate fallido no tumba la corrida. */
+  exportFails?: Error;
+  /** Cuantos archivos habia cuando se exporto: prueba el orden extraer->apagar. */
+  filesAtExport: number | null = null;
+  /** Estado del sandbox al momento de exportar. */
+  stoppedAtExport: number | null = null;
+
   async start(): Promise<void> {
     this.started++;
   }
@@ -215,6 +258,21 @@ export class FakeSandbox implements SandboxPort {
   async readFile(): Promise<string> {
     return '';
   }
+
+  async exportFiles(_options?: ExportOptions): Promise<WorkspaceExport> {
+    // El contrato real: exportar sobre un sandbox no iniciado es un error.
+    if (this.started === 0) throw new Error('El sandbox no esta iniciado.');
+    this.filesAtExport = this.files.length;
+    this.stoppedAtExport = this.stopped;
+    if (this.exportFails) throw this.exportFails;
+    return {
+      files: this.files,
+      skipped: [],
+      totalBytes: this.files.reduce((sum, f) => sum + f.bytes, 0),
+      truncated: false,
+    };
+  }
+
   async stop(): Promise<void> {
     this.stopped++;
   }
@@ -222,10 +280,34 @@ export class FakeSandbox implements SandboxPort {
 
 export class FakeSandboxFactory implements SandboxFactoryPort {
   readonly created: FakeSandbox[] = [];
-  create(): SandboxPort {
+  readonly contexts: SandboxContext[] = [];
+  /** Se aplica a cada sandbox creado, para preparar el escenario del test. */
+  constructor(private readonly prepare?: (sandbox: FakeSandbox) => void) {}
+
+  create(context: SandboxContext): SandboxPort {
     const sandbox = new FakeSandbox();
+    this.prepare?.(sandbox);
     this.created.push(sandbox);
+    this.contexts.push(context);
     return sandbox;
+  }
+}
+
+export class FakeSandboxJanitor implements SandboxJanitorPort {
+  readonly destroyed: string[] = [];
+  constructor(private managed: ManagedSandbox[] = []) {}
+
+  setManaged(managed: ManagedSandbox[]): void {
+    this.managed = managed;
+  }
+
+  async listManaged(): Promise<ManagedSandbox[]> {
+    return this.managed;
+  }
+
+  async destroy(containerId: string): Promise<void> {
+    this.destroyed.push(containerId);
+    this.managed = this.managed.filter((c) => c.containerId !== containerId);
   }
 }
 

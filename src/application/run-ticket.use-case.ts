@@ -6,14 +6,29 @@ import {
 } from '../domain/agent-runner.js';
 import type { LlmPort } from '../domain/ports/llm.port.js';
 import type { SandboxFactoryPort } from '../domain/ports/sandbox-factory.port.js';
+import type { ExportOptions, SandboxPort } from '../domain/ports/sandbox.port.js';
 import type {
   AgentRunSummary,
   TicketRepositoryPort,
 } from '../domain/ports/ticket-repository.port.js';
 import type { Ticket } from '../domain/ticket.js';
 
+/** Qué sobrevivió al sandbox. Se informa aunque la extracción haya fallado. */
+export interface ArtifactOutcome {
+  files: number;
+  bytes: number;
+  truncated: boolean;
+  error?: string;
+}
+
 export type RunTicketResult =
-  | { ok: true; ticket: Ticket; runId: string; summary: AgentRunSummary }
+  | {
+      ok: true;
+      ticket: Ticket;
+      runId: string;
+      summary: AgentRunSummary;
+      artifact: ArtifactOutcome;
+    }
   | { ok: false; reason: 'not_found' | 'already_taken' | 'invalid_status'; detail: string };
 
 /**
@@ -31,6 +46,8 @@ export class RunTicketUseCase {
     private readonly budget: Partial<AgentBudget> = {},
     /** Cada cuanto se reporta el latido. Menos de la mitad del umbral del reaper. */
     private readonly heartbeatMs = 30_000,
+    /** Techos de la extraccion. Ver SandboxPort.exportFiles. */
+    private readonly exportOptions: ExportOptions = {},
   ) {}
 
   async execute(
@@ -72,7 +89,10 @@ export class RunTicketUseCase {
       model: this.llm.modelName,
     });
 
-    const sandbox = this.sandboxes.create();
+    // El sandbox lleva el id de la corrida: es lo que despues permite saber,
+    // mirando solo Docker y la base, si un container que sobrevivio a su
+    // worker es basura o alguien trabajando.
+    const sandbox = this.sandboxes.create({ runId: run.id });
     let seq = 0;
 
     // Persistir el evento no debe poder matar la corrida: si falla el log,
@@ -105,8 +125,14 @@ export class RunTicketUseCase {
     const runStartedAt = Date.now();
 
     let summary: AgentRunSummary;
+    let artifact: ArtifactOutcome = { files: 0, bytes: 0, truncated: false };
+    // Sin start() no hay nada que extraer, y exportFiles tiraria un error
+    // que taparia el motivo real de la falla.
+    let started = false;
+
     try {
       await sandbox.start();
+      started = true;
 
       const techo = this.budget.maxWallClockMs ?? DEFAULT_BUDGET.maxWallClockMs;
       const restante = Math.max(techo - (Date.now() - runStartedAt), 0);
@@ -133,6 +159,14 @@ export class RunTicketUseCase {
         error: err instanceof Error ? err.message : String(err),
       };
     } finally {
+      // ORDEN CRITICO: extraer, despues apagar. `stop()` es irreversible, y
+      // lo que el agente escribio solo existe dentro del container.
+      if (started) {
+        artifact = await this.rescue(sandbox, run.id, persist);
+      }
+      // El latido se corta DESPUES de la extraccion: sacar un workspace
+      // grande lleva su tiempo, y dejar de latir mientras tanto haria que el
+      // reaper diera por muerta una corrida que esta terminando bien.
       clearInterval(beat);
       await sandbox.stop();
     }
@@ -149,6 +183,47 @@ export class RunTicketUseCase {
       ticket: finished ?? { ...claimed, status: finalStatus },
       runId: run.id,
       summary,
+      artifact,
     };
+  }
+
+  /**
+   * Saca el trabajo del sandbox y lo persiste.
+   *
+   * No puede tumbar la corrida: si el agente resolvio la tarea, que falle el
+   * rescate no invalida lo que hizo. Pero tampoco se calla — el error queda
+   * en la traza, porque un PR vacio sin explicacion es peor que uno que dice
+   * por que esta vacio.
+   *
+   * Cuando la fase 2 abra Pull Requests esto cambia de peso: sin artefacto no
+   * hay PR posible, y ahi el que decide que hacer es el flujo del PR, no este
+   * metodo.
+   */
+  private async rescue(
+    sandbox: SandboxPort,
+    runId: string,
+    persist: (event: AgentEvent) => Promise<void>,
+  ): Promise<ArtifactOutcome> {
+    try {
+      const exported = await sandbox.exportFiles(this.exportOptions);
+      await this.tickets.saveRunArtifact(runId, exported);
+
+      const outcome: ArtifactOutcome = {
+        files: exported.files.length,
+        bytes: exported.totalBytes,
+        truncated: exported.truncated,
+      };
+      await persist({ type: 'artifact', ...outcome });
+      return outcome;
+    } catch (err) {
+      const outcome: ArtifactOutcome = {
+        files: 0,
+        bytes: 0,
+        truncated: false,
+        error: err instanceof Error ? err.message : String(err),
+      };
+      await persist({ type: 'artifact', ...outcome });
+      return outcome;
+    }
   }
 }

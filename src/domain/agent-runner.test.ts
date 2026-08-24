@@ -2,7 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { AgentRunner, type AgentEvent } from './agent-runner.js';
 import type { LlmPort, LlmResponse } from './ports/llm.port.js';
-import type { ExecResult, SandboxPort } from './ports/sandbox.port.js';
+import type {
+  ExecResult,
+  SandboxPort,
+  WorkspaceExport,
+} from './ports/sandbox.port.js';
 
 /**
  * Tests del loop. Dobles locales a proposito: el dominio no deberia importar
@@ -26,6 +30,9 @@ class NoopSandbox implements SandboxPort {
   async writeFile(): Promise<void> {}
   async readFile(): Promise<string> {
     return '';
+  }
+  async exportFiles(): Promise<WorkspaceExport> {
+    return { files: [], skipped: [], totalBytes: 0, truncated: false };
   }
   async stop(): Promise<void> {}
 }

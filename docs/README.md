@@ -23,6 +23,8 @@ Una spec puede describir algo que todavía no existe; un ADR nunca.
 | [0007](adr/0007-el-veredicto-no-es-del-agente.md) | El veredicto no lo da el agente | Aceptada |
 | [0008](adr/0008-liveness-por-latido.md) | La vida de una corrida se mide con latidos | Aceptada |
 | [0009](adr/0009-la-api-no-ejecuta.md) | La API no ejecuta agentes; el claim vive en el worker | Aceptada |
+| [0010](adr/0010-git-fuera-del-sandbox.md) | Git corre fuera del sandbox | Aceptada |
+| [0011](adr/0011-identidad-del-container.md) | El container lleva el id de su corrida | Aceptada |
 
 ## Comportamiento (Spec)
 
@@ -30,7 +32,7 @@ Una spec puede describir algo que todavía no existe; un ADR nunca.
 |---|---|---|---|
 | [001](specs/001-ciclo-de-vida-del-ticket.md) | Ciclo de vida del ticket | 1 | Implementada |
 | [002](specs/002-ejecucion-asincrona.md) | Ejecución asíncrona y recuperación | 1b | Implementada |
-| [003](specs/003-pull-requests.md) | Ramas y pull requests | 2 | Especificada |
+| [003](specs/003-pull-requests.md) | Ramas y pull requests | 2 | Prerequisito hecho |
 | [004](specs/004-gates-de-calidad.md) | Gates de calidad | 3 | Especificada |
 | [005](specs/005-despliegue.md) | Despliegue | 6 | Especificada |
 

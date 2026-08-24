@@ -1,6 +1,9 @@
 # Spec 003 — Ramas y pull requests
 
-**Fase:** 2 · **Estado:** Especificada
+**Fase:** 2 · **Estado:** Prerequisito implementado, PRs pendientes
+
+> El rescate del trabajo (la sección "El problema a resolver primero") está
+> hecho y verificado. Todo lo que sigue —ramas, push, PR— no.
 
 ## Objetivo
 
@@ -14,6 +17,12 @@ cierre. Pero no se puede abrir un PR con código que ya no existe.
 
 Extraer el trabajo antes de destruir el container es **prerequisito**, no una
 mejora.
+
+> **Resuelto el 2026-08-24.** `SandboxPort.exportFiles()` saca el workspace y
+> lo persiste en `run_artifacts` antes del `stop()`. Ver
+> [ADR 0010](../adr/0010-git-fuera-del-sandbox.md) y la sección
+> [Extracción del trabajo](#extracción-del-trabajo), reescrita con lo que se
+> construyó.
 
 ## Dos mecanismos, no uno
 
@@ -62,19 +71,49 @@ externa (los checks de CI, ver [spec 004](004-gates-de-calidad.md)).
 
 ### Extracción del trabajo
 
-Antes del `stop()`, dentro del sandbox:
+> Reescrita el 2026-08-24. El diseño original hacía `git format-patch` **dentro**
+> del container; ver abajo por qué no.
 
-```bash
-git add -A && git commit -m "<mensaje>"
-git format-patch origin/main --stdout
+El sandbox exporta los archivos; git corre del lado del orquestador
+([ADR 0010](../adr/0010-git-fuera-del-sandbox.md)).
+
+```
+SANDBOX (sin git, sin red, sin credenciales)
+  /workspace  ──exportFiles()──▶  archivos
+                                     │
+ORQUESTADOR                          ▼
+  run_artifacts  ──▶  git apply / commit / push  ──▶  PR
+                          el PAT vive sólo acá
 ```
 
-El patch se guarda en `agent_runs.patch` (o en un blob con puntero, si es
-grande). Así el trabajo sobrevive al container aunque el push falle, y el PR se
-puede reintentar sin reejecutar al agente.
+**Por qué no adentro.** La imagen del sandbox no trae git, pero eso es lo de
+menos: se compra una imagen más pesada. El problema real es que esta misma spec
+exige, en [Credenciales](#credenciales), que el PAT **no** entre al container —
+y con git adentro eso obliga a construir un proxy cuyo único propósito es
+sostener la contradicción. Con git afuera no hay token que proteger adentro.
 
-**Esto es lo que hace que un fallo en el paso 4 o 5 no desperdicie una corrida
-completa.**
+Lo extraído se persiste en `run_artifacts` (tabla aparte de `agent_runs`, para
+no encarecer el listado que el tablero pide todo el tiempo):
+
+| Columna | Qué guarda |
+|---|---|
+| `files` | `[{ path, content, bytes }]` |
+| `skipped` | `[{ path, bytes, reason }]` — lo que no entró, y por qué |
+| `file_count`, `total_bytes`, `truncated` | resumen barato de consultar |
+
+Techos por default: 512 KB por archivo, 4 MB en total, podando `node_modules`,
+`.git`, `dist` y `.next` por nombre a cualquier profundidad. Lo que se pasa se
+registra como omitido (`too_large`, `budget`) en vez de desaparecer. Los
+binarios se detectan por byte nulo y se omiten (`binary`): guardarlos como texto
+los corrompería en silencio.
+
+El rescate **no puede tumbar la corrida**. Si el agente resolvió la tarea, que
+falle sacar los archivos no invalida lo que hizo: el error queda en la traza
+como evento `artifact` y la corrida cierra con su veredicto. Cuando esta fase
+abra PRs, sin artefacto no habrá PR posible — pero esa decisión pertenece al
+flujo del PR, no al rescate.
+
+Expuesto en `GET /tickets/:id/runs/:runId/artifact`.
 
 ### Puerto nuevo
 
@@ -95,14 +134,15 @@ sabe que existe Groq ([ADR 0002](../adr/0002-proveedor-de-llm-agnostico.md)).
 
 ### Credenciales
 
-El PAT del repositorio **no entra al container**. Las operaciones de git salen
-por un proxy que inyecta el token después de que la request abandona el sandbox.
-Código que corra dentro —incluido el que escriba el agente— no puede leerlo.
+El PAT del repositorio **no entra al container**, y no hace falta ningún proxy
+para lograrlo: git no corre adentro
+([ADR 0010](../adr/0010-git-fuera-del-sandbox.md)). El sandbox sólo ejecuta
+código no confiable y devuelve archivos; clonar, pushear y abrir el PR pasan del
+lado del orquestador.
 
-Con Docker local hay que construir ese proxy, o aceptar que el token vive en el
-container. **Si se acepta, hay que declararlo**: contradice parcialmente el
-[ADR 0003](../adr/0003-sandbox-como-unica-frontera.md) y sube el riesgo de una
-inyección de prompt.
+Importa más de lo que parece: lo que corre en el sandbox es código escrito por
+un modelo a partir de texto que no controlamos. Un PAT con `Contents: write` ahí
+adentro es exactamente lo que una inyección de prompt querría encontrar.
 
 ## Contenido del PR
 
@@ -134,7 +174,9 @@ sobre sí mismo ([ADR 0007](../adr/0007-el-veredicto-no-es-del-agente.md)).
 
 ## Criterio de aceptación
 
-- [ ] El patch se persiste antes de destruir el container.
+- [x] El trabajo se persiste antes de destruir el container.
+      → `exportFiles()` corre en el `finally`, antes de `stop()`; el test
+      verifica el ORDEN, no sólo que ambos pasen.
 - [ ] Un ticket ejecutado produce una rama `feature/TICKET-<id>` con commits.
 - [ ] Se crea el PR y el ticket pasa a `PR_OPEN`.
 - [ ] El cuerpo del PR se arma desde la traza, no desde el texto del agente.

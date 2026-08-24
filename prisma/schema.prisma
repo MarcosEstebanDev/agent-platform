@@ -52,12 +52,35 @@ model AgentRun {
   outputTokens Int       @default(0) @map("output_tokens")
   error        String?
 
-  events AgentEvent[]
+  events   AgentEvent[]
+  artifact RunArtifact?
 
   @@index([ticketId])
   /// Para el barrido del reaper: corridas abiertas ordenadas por latido.
   @@index([finishedAt, heartbeatAt])
   @@map("agent_runs")
+}
+
+/// El trabajo que el agente dejó en el workspace, rescatado antes de destruir
+/// el container. Sin esto el código muere con el sandbox y no hay nada que
+/// poner en un Pull Request.
+///
+/// Tabla aparte y no columnas en `agent_runs` porque el dashboard lista
+/// corridas constantemente: arrastrar el contenido de los archivos en cada
+/// listado encarece la lectura más frecuente del sistema.
+model RunArtifact {
+  runId String   @id @map("run_id")
+  run   AgentRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  /// [{ path, content, bytes }]
+  files Json
+  /// [{ path, bytes, reason }] — lo que quedó afuera, y por qué.
+  skipped    Json
+  fileCount  Int      @map("file_count")
+  totalBytes Int      @map("total_bytes")
+  truncated  Boolean  @default(false)
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@map("run_artifacts")
 }
 
 /// Log append-only de lo que hizo el agente. Es la traza de auditoría:

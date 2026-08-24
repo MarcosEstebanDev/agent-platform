@@ -13,7 +13,8 @@ src/
 ├── domain/                    ← puro, sin frameworks ni SDKs
 │   ├── ports/
 │   │   ├── llm.port.ts        "completá con estas tools"
-│   │   ├── sandbox.port.ts    "ejecutá esto de forma aislada"
+│   │   ├── sandbox.port.ts    "ejecutá esto aislado" + "sacá el trabajo"
+│   │   ├── sandbox-janitor.port.ts  limpieza de containers huérfanos
 │   │   ├── queue.port.ts      "encolá esta corrida"
 │   │   └── ticket-repository.port.ts
 │   ├── agent-runner.ts        el loop del agente + presupuestos
@@ -22,6 +23,7 @@ src/
 │   ├── enqueue-ticket.use-case.ts   valida, marca ASSIGNED y encola
 │   ├── run-ticket.use-case.ts       claim → agente → traza → veredicto
 │   ├── reap-stale-runs.use-case.ts  cierra corridas sin latido
+│   ├── sweep-orphan-sandboxes.use-case.ts  destruye containers huérfanos
 │   └── fakes.ts                     dobles de prueba compartidos
 ├── infrastructure/
 │   ├── llm/openai-compatible.adapter.ts   cualquier proveedor OpenAI-compatible
@@ -48,6 +50,11 @@ y el sandbox no se tocan.
 La API arranca sin `LLM_API_KEY` y sin Docker — ver
 [ADR 0009](docs/adr/0009-la-api-no-ejecuta.md).
 
+**Git no entra al sandbox.** El sandbox ejecuta código no confiable y devuelve
+archivos; clonar, commitear y pushear pasan del lado del orquestador, así que
+ninguna credencial cruza esa frontera — ver
+[ADR 0010](docs/adr/0010-git-fuera-del-sandbox.md).
+
 ## Estado
 
 | Fase | Qué | Estado |
@@ -57,14 +64,16 @@ La API arranca sin `LLM_API_KEY` y sin Docker — ver
 | **1** | Orquestador NestJS: ticket + máquina de estados + traza | ✅ verificado |
 | **1b** | Async: cola, reaper por latido, presupuestos, DLQ — [spec 002](docs/specs/002-ejecucion-asincrona.md) | ✅ verificado |
 | **—** | Dashboard: tablero + traza en vivo | ✅ |
-| **—** | Tests (44) + 9 ADRs + 5 specs | ✅ |
-| 2 | Ramas y pull requests — [spec 003](docs/specs/003-pull-requests.md) | 📄 especificada |
+| **—** | Rescate del workspace + limpieza de containers huérfanos | ✅ verificado |
+| **—** | Tests (70) + 11 ADRs + 5 specs | ✅ |
+| 2 | Ramas y pull requests — [spec 003](docs/specs/003-pull-requests.md) | 🟡 prerequisito hecho |
 | 3 | Gates de calidad — [spec 004](docs/specs/004-gates-de-calidad.md) | 📄 especificada |
 | 4 | Multiagente: Tech Lead → Developer / Reviewer / QA | ⬜ |
 | 5 | Rúbricas = criterios de aceptación ejecutables | ⬜ |
 | 6 | Despliegue — [spec 005](docs/specs/005-despliegue.md) | 📄 especificada |
 
 📄 = diseñada y documentada con criterio de aceptación, sin implementar.
+🟡 = el trabajo del agente ya sobrevive al sandbox; falta rama, push y PR.
 
 ## Arranque
 
@@ -72,7 +81,7 @@ Requiere **Docker Desktop corriendo** y Node 22+.
 
 ```bash
 npm install
-npm test             # 44 tests — sin base, sin Docker, sin Redis, sin LLM
+npm test             # 70 tests — sin base, sin Docker, sin Redis, sin LLM
 npm run smoke        # verifica el sandbox — no necesita ninguna key
 
 cp .env.example .env # completar LLM_API_KEY
@@ -124,6 +133,9 @@ curl localhost:3000/tickets
 curl localhost:3000/tickets?status=DONE
 curl localhost:3000/tickets/<id>/runs
 curl "localhost:3000/tickets/<id>/runs/<runId>/events?after=0"
+
+# el codigo que el agente escribio, rescatado antes de destruir el container
+curl localhost:3000/tickets/<id>/runs/<runId>/artifact
 ```
 
 La traza es append-only: `?after=<último seq>` trae sólo lo nuevo. Encolar dos
@@ -159,7 +171,7 @@ El límite que muerde en un loop agéntico no es el de tokens sino el de
 ## Tests
 
 ```bash
-npm test        # 44 tests, ~1.7 s
+npm test        # 70 tests, ~450 ms
 ```
 
 Corren **sin base de datos, sin Docker, sin Redis y sin LLM**: la lógica de orquestación se
@@ -174,6 +186,12 @@ hexagonal, y la razón por la que los puertos valen su indirección.
   encolar, e idempotencia.
 - `src/application/reap-stale-runs.use-case.test.ts` — el umbral de latido.
 - `src/domain/agent-runner.test.ts` — los tres presupuestos y cuál corta primero.
+- `src/application/sweep-orphan-sandboxes.use-case.test.ts` — qué container es
+  basura y cuál está trabajando.
+- `src/infrastructure/sandbox/docker.sandbox.test.ts` — la extracción del
+  workspace: rutas con comillas, espacios, acentos y saltos de línea; binarios;
+  y que un patrón de exclusión no pueda inyectar shell. Son funciones puras, así
+  que tampoco necesitan Docker.
 
 ## Documentación
 
@@ -183,7 +201,8 @@ Las decisiones y el comportamiento están en **[`docs/`](docs/README.md)**:
   Arquitectura hexagonal, proveedor agnóstico, el sandbox como única frontera,
   lista blanca de transiciones, compare-and-set, traza append-only, por qué
   el veredicto no lo da el agente, por qué la vida de una corrida se mide con
-  latidos y no con relojes, y por qué la API no ejecuta agentes.
+  latidos y no con relojes, por qué la API no ejecuta agentes, por qué git corre
+  fuera del sandbox y por qué el container lleva el id de su corrida.
 - **[Specs](docs/README.md#comportamiento-spec)** — qué tiene que pasar, esté
   implementado o no. Incluye el diseño completo de PRs, gates de calidad y
   despliegue, que todavía no están construidos.

@@ -1,4 +1,5 @@
 import type { AgentBudget } from './domain/agent-runner.js';
+import type { ExportOptions } from './domain/ports/sandbox.port.js';
 import { OpenAiCompatibleAdapter } from './infrastructure/llm/openai-compatible.adapter.js';
 import { DockerSandboxFactory } from './infrastructure/sandbox/docker-sandbox.factory.js';
 
@@ -31,6 +32,29 @@ export function buildSandboxFactory(): DockerSandboxFactory {
     // default inseguro nunca se activa por un typo.
     network: process.env.SANDBOX_NETWORK === 'bridge' ? 'bridge' : 'none',
   });
+}
+
+/**
+ * Techos de la extraccion del workspace.
+ *
+ * Mismo criterio que `readBudget`: solo las claves configuradas, para no
+ * pisar los defaults del adapter con `undefined`.
+ */
+export function readExportOptions(): ExportOptions {
+  const options: ExportOptions = {};
+
+  const maxFileBytes = readInt('EXPORT_MAX_FILE_BYTES');
+  if (maxFileBytes !== undefined) options.maxFileBytes = maxFileBytes;
+
+  const maxTotalBytes = readInt('EXPORT_MAX_TOTAL_BYTES');
+  if (maxTotalBytes !== undefined) options.maxTotalBytes = maxTotalBytes;
+
+  const exclude = process.env.EXPORT_EXCLUDE;
+  if (exclude?.trim()) {
+    options.exclude = exclude.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
+  return options;
 }
 
 /**

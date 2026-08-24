@@ -1,12 +1,20 @@
 import { Worker, type Job } from 'bullmq';
 import { ReapStaleRunsUseCase } from '../application/reap-stale-runs.use-case.js';
 import { RunTicketUseCase } from '../application/run-ticket.use-case.js';
-import { buildLlm, buildSandboxFactory, readBudget, readInt } from '../config.js';
+import { SweepOrphanSandboxesUseCase } from '../application/sweep-orphan-sandboxes.use-case.js';
+import {
+  buildLlm,
+  buildSandboxFactory,
+  readBudget,
+  readExportOptions,
+  readInt,
+} from '../config.js';
 import {
   createPrismaClient,
   requireDatabaseUrl,
 } from '../infrastructure/persistence/prisma-client.factory.js';
 import { PrismaTicketRepository } from '../infrastructure/persistence/prisma-ticket.repository.js';
+import { DockerSandboxJanitor } from '../infrastructure/sandbox/docker-sandbox.janitor.js';
 import {
   redisConnection,
   RUNS_QUEUE,
@@ -30,13 +38,28 @@ const concurrency = readInt('WORKER_CONCURRENCY') ?? 2;
 const reaperIntervalMs = readInt('REAPER_INTERVAL_MS') ?? 30_000;
 // 90s = tres latidos perdidos. Menos que eso arriesga matar corridas vivas.
 const staleAfterMs = readInt('REAPER_STALE_AFTER_MS') ?? 90_000;
+// Gracia antes de que un container sea candidato a huerfano. Cubre la ventana
+// entre marcar la corrida terminada y que stop() alcance a destruirlo.
+const orphanGraceMs = readInt('SANDBOX_ORPHAN_GRACE_MS') ?? 60_000;
 
 const prisma = createPrismaClient(requireDatabaseUrl());
 const tickets = new PrismaTicketRepository(prisma);
 const llm = buildLlm();
 
-const runTicket = new RunTicketUseCase(tickets, llm, buildSandboxFactory(), readBudget());
+const runTicket = new RunTicketUseCase(
+  tickets,
+  llm,
+  buildSandboxFactory(),
+  readBudget(),
+  undefined,
+  readExportOptions(),
+);
 const reaper = new ReapStaleRunsUseCase(tickets, staleAfterMs);
+const janitor = new SweepOrphanSandboxesUseCase(
+  tickets,
+  new DockerSandboxJanitor(),
+  orphanGraceMs,
+);
 
 // La conexion se construye aca y se cierra aca: BullMQ no cierra las que no creo.
 const connection = redisConnection(redisUrl);
@@ -63,6 +86,14 @@ const worker = new Worker<RunTicketJobData>(
       `  ${result.ticket.status}  ${result.summary.iterations} iteraciones  ` +
         `${result.summary.inputTokens + result.summary.outputTokens} tokens`,
     );
+    if (result.artifact.error) {
+      console.warn(`  ! no se pudo rescatar el workspace: ${result.artifact.error}`);
+    } else {
+      console.log(
+        `  ${result.artifact.files} archivo(s) rescatado(s), ` +
+          `${result.artifact.bytes} bytes${result.artifact.truncated ? ' (truncado)' : ''}`,
+      );
+    }
     return { status: result.ticket.status, runId: result.runId };
   },
   { connection, concurrency },
@@ -86,6 +117,21 @@ const sweep = setInterval(() => {
     })
     .catch((err: unknown) => {
       console.error('[reaper] fallo el barrido:', err instanceof Error ? err.message : err);
+    });
+
+  // Segundo barrido, independiente del primero. El reaper cierra la corrida en
+  // la base; este libera la memoria de la maquina. Se coordinan a traves de la
+  // base y no entre ellos: el reaper marca terminada la corrida, y en el
+  // barrido siguiente el janitor ve un container cuya corrida ya cerro.
+  void janitor
+    .execute()
+    .then(({ destroyed, runIds }) => {
+      if (destroyed > 0) {
+        console.warn(`[janitor] ${destroyed} sandbox(es) huerfano(s): ${runIds.join(', ')}`);
+      }
+    })
+    .catch((err: unknown) => {
+      console.error('[janitor] fallo el barrido:', err instanceof Error ? err.message : err);
     });
 }, reaperIntervalMs);
 

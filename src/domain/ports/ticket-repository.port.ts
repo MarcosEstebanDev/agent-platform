@@ -1,5 +1,6 @@
 import type { Ticket, TicketStatus } from '../ticket.js';
 import type { AgentEvent } from '../agent-runner.js';
+import type { WorkspaceExport } from './sandbox.port.js';
 
 /**
  * Persistencia del ticket y de la traza de sus corridas.
@@ -53,6 +54,18 @@ export interface StaleRun {
   ticketId: string;
 }
 
+/**
+ * El trabajo que el agente dejó en el workspace, ya fuera del sandbox.
+ *
+ * Se guarda aparte de la corrida y no dentro de ella: el dashboard lista
+ * corridas todo el tiempo, y arrastrar el contenido de los archivos en cada
+ * listado convertiria una lectura barata en una cara.
+ */
+export interface StoredArtifact extends WorkspaceExport {
+  runId: string;
+  createdAt: Date;
+}
+
 export interface TicketRepositoryPort {
   create(input: { title: string; task: string }): Promise<Ticket>;
   findById(id: string): Promise<Ticket | null>;
@@ -83,6 +96,23 @@ export interface TicketRepositoryPort {
 
   /** Corridas abiertas cuyo ultimo latido es anterior a `deadline`. */
   findStaleRuns(deadline: Date): Promise<StaleRun[]>;
+
+  /**
+   * De los ids dados, cuales siguen sin terminar.
+   *
+   * Lo usa el barrido de sandboxes huerfanos: la base es la unica fuente de
+   * verdad sobre si una corrida sigue viva, asi que un worker puede decidir
+   * que un container ajeno es basura sin hablar con nadie.
+   */
+  findOpenRunIds(runIds: string[]): Promise<string[]>;
+
+  /**
+   * Persiste el trabajo extraido del sandbox. Idempotente por runId: un
+   * reintento de la extraccion pisa el resultado anterior en vez de duplicar.
+   */
+  saveRunArtifact(runId: string, artifact: WorkspaceExport): Promise<void>;
+
+  getRunArtifact(runId: string): Promise<StoredArtifact | null>;
 
   listRuns(ticketId: string): Promise<AgentRunRecord[]>;
 

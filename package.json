@@ -20,7 +20,7 @@
     "dashboard:install": "npm --prefix apps/dashboard install",
     "dashboard:build": "npm --prefix apps/dashboard run build",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test src/domain/*.test.ts src/application/*.test.ts"
+    "test": "node --import tsx --test src/domain/*.test.ts src/application/*.test.ts src/infrastructure/sandbox/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^26.2.0",

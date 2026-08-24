@@ -6,8 +6,14 @@ import type {
   AgentRunSummary,
   RunOutcome,
   StaleRun,
+  StoredArtifact,
   TicketRepositoryPort,
 } from '../../domain/ports/ticket-repository.port.js';
+import type {
+  SkippedFile,
+  WorkspaceExport,
+  WorkspaceFile,
+} from '../../domain/ports/sandbox.port.js';
 import type { Ticket, TicketStatus } from '../../domain/ticket.js';
 
 export class PrismaTicketRepository implements TicketRepositoryPort {
@@ -107,6 +113,53 @@ export class PrismaTicketRepository implements TicketRepositoryPort {
       },
       select: { id: true, ticketId: true },
     });
+  }
+
+  async findOpenRunIds(runIds: string[]): Promise<string[]> {
+    if (runIds.length === 0) return [];
+    const open = await this.prisma.agentRun.findMany({
+      where: { id: { in: runIds }, finishedAt: null },
+      select: { id: true },
+    });
+    return open.map((r) => r.id);
+  }
+
+  /**
+   * Idempotente por runId: reintentar la extraccion pisa el resultado
+   * anterior en vez de acumular versiones a medias.
+   */
+  async saveRunArtifact(runId: string, artifact: WorkspaceExport): Promise<void> {
+    // Prisma exige que una columna `Json` cumpla `InputJsonValue`, que pide
+    // index signature; nuestras interfaces del dominio no la tienen aunque
+    // serialicen identico. El cast es seguro porque son datos planos: sin
+    // Date, sin undefined, sin instancias de clase.
+    const data = {
+      files: artifact.files as unknown as object,
+      skipped: artifact.skipped as unknown as object,
+      fileCount: artifact.files.length,
+      totalBytes: artifact.totalBytes,
+      truncated: artifact.truncated,
+    };
+    await this.prisma.runArtifact.upsert({
+      where: { runId },
+      create: { runId, ...data },
+      update: data,
+    });
+  }
+
+  async getRunArtifact(runId: string): Promise<StoredArtifact | null> {
+    const row = await this.prisma.runArtifact.findUnique({ where: { runId } });
+    if (!row) return null;
+    // Prisma devuelve `Json` como unknown: el contrato lo garantiza la
+    // escritura, que es la unica que toca estas columnas.
+    return {
+      runId: row.runId,
+      createdAt: row.createdAt,
+      files: row.files as unknown as WorkspaceFile[],
+      skipped: row.skipped as unknown as SkippedFile[],
+      totalBytes: row.totalBytes,
+      truncated: row.truncated,
+    };
   }
 
   async listRuns(ticketId: string): Promise<AgentRunRecord[]> {

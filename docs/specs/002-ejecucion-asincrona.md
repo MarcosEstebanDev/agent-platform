@@ -139,8 +139,9 @@ Verificado el 2026-08-23 con 11 corridas reales contra Groq (costo US$0).
 
 ## Deuda conocida (no bloquea esta spec)
 
-1. **Containers huérfanos.** Si el worker muere, `sandbox.stop()` nunca corre. El
-   reaper limpia la base pero no Docker: hay que borrarlos con `docker rm -f agent-sbx-*`.
+1. ~~**Containers huérfanos.**~~ **Resuelto el 2026-08-24.** El container lleva el
+   id de su corrida como label, y un segundo barrido destruye aquellos cuya corrida
+   la base da por cerrada. Ver [ADR 0011](../adr/0011-identidad-del-container.md).
 2. **Contabilidad perdida en excepciones.** Si la corrida explota, `iterations` y
    `tokens` se persisten en 0 aunque se hayan gastado.
 3. **Un tool call malformado mata la corrida.** El proveedor devuelve 400
