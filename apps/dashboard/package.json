@@ -1,0 +1,23 @@
+{
+  "name": "agent-platform-dashboard",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Dashboard de la plataforma: tickets, corridas y traza del agente",
+  "scripts": {
+    "dev": "next dev -p 4000",
+    "build": "next build",
+    "start": "next start -p 4000",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "^15.5.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/react": "^19.1.0",
+    "@types/react-dom": "^19.1.0",
+    "typescript": "^5.7.2"
+  }
+}

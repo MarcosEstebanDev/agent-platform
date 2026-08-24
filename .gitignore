@@ -4,3 +4,8 @@ node_modules/
 
 # Cliente de Prisma: se regenera con `prisma generate` (postinstall)
 src/generated/
+
+# Dashboard (Next.js)
+apps/dashboard/.next/
+apps/dashboard/next-env.d.ts
+apps/dashboard/tsconfig.tsbuildinfo
