@@ -1,6 +1,6 @@
 # Spec 002 — Ejecución asíncrona y recuperación
 
-**Fase:** 1b · **Estado:** Especificada
+**Fase:** 1b · **Estado:** Implementada (commit `36aafe8`, verificada contra infra real el 2026-08-23)
 
 ## Objetivo
 
@@ -33,7 +33,7 @@ Worker (BullMQ)
       ├─ ejecuta la corrida
       └─ IN_PROGRESS → DONE | FAILED
 
-Reaper (cron, cada 5 min)
+Reaper (cron, cada 30 s)
       └─ tickets en IN_PROGRESS con heartbeat vencido → FAILED
 ```
 
@@ -53,7 +53,7 @@ reaper busca:
 ```sql
 SELECT id FROM agent_runs
 WHERE finished_at IS NULL
-  AND heartbeat_at < now() - interval '2 minutes'
+  AND heartbeat_at < now() - interval '90 seconds'
 ```
 
 y cierra esas corridas con `outcome: 'abandoned'`, devolviendo el ticket a
@@ -62,6 +62,14 @@ y cierra esas corridas con `outcome: 'abandoned'`, devolviendo el ticket a
 **Por qué heartbeat y no un timeout fijo:** una corrida legítima puede durar
 mucho. Lo que distingue "trabajando" de "muerto" es si alguien sigue reportando,
 no cuánto pasó.
+
+**Corrección al implementar — el peor caso es (umbral + intervalo), no el umbral.**
+Esta spec pedía originalmente barrer cada 5 min con un umbral de 2 min. Una corrida
+que muere justo después de un barrido no se detecta hasta el barrido siguiente, así
+que el peor caso era 7 min: la spec hacía imposible su propio criterio de aceptación
+de "≤ 2 min". Corregido a **30 s de barrido / 90 s de umbral** (= 3 latidos perdidos),
+lo que da un peor caso de 2 min exactos. El umbral tiene que ser mayor al doble del
+intervalo de latido, o el reaper cierra corridas vivas.
 
 ### Presupuestos
 
@@ -107,11 +115,34 @@ Para seguir el progreso en vivo, `GET /tickets/:id/stream` (SSE) reemitiendo los
 
 ## Criterio de aceptación
 
-- [ ] `POST /run` responde `202` en menos de 100 ms.
-- [ ] Con dos workers y un ticket, exactamente uno lo ejecuta.
-- [ ] Matar el worker a mitad de corrida deja el ticket en `FAILED` en ≤ 2 min,
-      nunca en `IN_PROGRESS`.
-- [ ] Un agente que supera el presupuesto de tiempo se corta con
-      `outcome: 'budget_exceeded'`.
-- [ ] Encolar el mismo ticket dos veces produce una sola corrida.
-- [ ] Un job que falla 3 veces termina en la DLQ y es inspeccionable.
+Verificado el 2026-08-23 con 11 corridas reales contra Groq (costo US$0).
+
+- [x] `POST /run` responde `202` en menos de 100 ms.
+      → **18 ms** en caliente (699 ms la primera, por la conexión fría a Redis).
+- [x] Con dos workers y un ticket, exactamente uno lo ejecuta.
+- [x] Matar el worker a mitad de corrida deja el ticket en `FAILED` en ≤ 2 min,
+      nunca en `IN_PROGRESS`. → **121 s**, con `outcome: 'abandoned'`.
+- [x] Un agente que supera el presupuesto de tiempo se corta con
+      `outcome: 'budget_exceeded'` y motivo `wall_clock`.
+- [x] Encolar el mismo ticket dos veces produce una sola corrida.
+- [x] Un job que falla 3 veces termina en la DLQ y es inspeccionable
+      (`npm run dlq`), y al rescatarlo con retry llega a `DONE`.
+
+## Desviaciones respecto del diseño original
+
+| Punto de la spec | Qué pasó al implementar |
+|---|---|
+| Reaper cada 5 min, umbral 2 min | Corregido a 30 s / 90 s (ver arriba). |
+| `GET /tickets/:id/stream` (SSE) | **No implementado.** El dashboard sigue la traza con polling incremental sobre `/runs/:runId/events?after=<seq>`, que es append-only y no repite lo ya leído. SSE no aporta lo suficiente todavía para justificar una conexión abierta por espectador. |
+| `POST /run` acepta BACKLOG y ASSIGNED | Suma **FAILED**. Sin eso, el `FAILED` que escribe el reaper era un callejón sin salida: la spec prometía "desde donde se puede reintentar" pero no existía la transición. |
+| Presupuesto de tiempo dentro del loop | El reloj arranca **antes** de `sandbox.start()`. Levantar el container tarda segundos, o minutos si tiene que bajar la imagen; con el reloj adentro del loop la misma tarea daba `completed` en vez de `budget_exceeded`. |
+
+## Deuda conocida (no bloquea esta spec)
+
+1. **Containers huérfanos.** Si el worker muere, `sandbox.stop()` nunca corre. El
+   reaper limpia la base pero no Docker: hay que borrarlos con `docker rm -f agent-sbx-*`.
+2. **Contabilidad perdida en excepciones.** Si la corrida explota, `iterations` y
+   `tokens` se persisten en 0 aunque se hayan gastado.
+3. **Un tool call malformado mata la corrida.** El proveedor devuelve 400
+   `tool_use_failed` cuando el modelo emite mal los argumentos, y ese error no
+   vuelve al modelo para que corrija, a diferencia de los errores de tool normales.

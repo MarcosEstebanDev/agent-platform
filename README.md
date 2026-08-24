@@ -13,34 +13,40 @@ src/
 ├── domain/                    ← puro, sin frameworks ni SDKs
 │   ├── ports/
 │   │   ├── llm.port.ts        "completá con estas tools"
-│   │   └── sandbox.port.ts    "ejecutá esto de forma aislada"
-│   └── agent-runner.ts        el loop del agente
-│   ├── ticket.ts              máquina de estados (lista blanca de transiciones)
-│   └── ports/
-│       ├── ticket-repository.port.ts
-│       └── sandbox-factory.port.ts
+│   │   ├── sandbox.port.ts    "ejecutá esto de forma aislada"
+│   │   ├── queue.port.ts      "encolá esta corrida"
+│   │   └── ticket-repository.port.ts
+│   ├── agent-runner.ts        el loop del agente + presupuestos
+│   └── ticket.ts              máquina de estados (lista blanca de transiciones)
 ├── application/
-│   └── run-ticket.use-case.ts  orquesta: claim → agente → traza → veredicto
+│   ├── enqueue-ticket.use-case.ts   valida, marca ASSIGNED y encola
+│   ├── run-ticket.use-case.ts       claim → agente → traza → veredicto
+│   ├── reap-stale-runs.use-case.ts  cierra corridas sin latido
+│   └── fakes.ts                     dobles de prueba compartidos
 ├── infrastructure/
-│   ├── llm/
-│   │   └── openai-compatible.adapter.ts   cualquier proveedor OpenAI-compatible
-│   ├── persistence/
-│   │   ├── prisma-client.factory.ts       driver adapter (Prisma 7)
-│   │   └── prisma-ticket.repository.ts
-│   └── sandbox/
-│       ├── docker.sandbox.ts              Docker local
-│       └── docker-sandbox.factory.ts      un container por corrida
-├── api/                       NestJS: controller + composition root
+│   ├── llm/openai-compatible.adapter.ts   cualquier proveedor OpenAI-compatible
+│   ├── queue/bullmq-queue.adapter.ts      BullMQ + Redis
+│   ├── persistence/                       Prisma 7 (driver adapter)
+│   └── sandbox/                           Docker local, un container por corrida
+├── api/                       NestJS: encola y consulta. NO ejecuta agentes.
+├── worker/                    consume la cola, corre el agente, late y barre
+├── config.ts                  lectura de env compartida
+├── dlq.ts                     inspecciona y rescata jobs muertos
 ├── run.ts                     agente suelto, sin persistencia
 ├── models.ts                  lista los modelos que habilita tu API key
 ├── smoke.ts                   verifica el sandbox sin usar el LLM
 └── db-smoke.ts                verifica la persistencia sin usar el LLM
 
+apps/dashboard/                Next.js 15: tablero y traza en vivo (puerto 4000)
 reference/managed-agents/      Managed Agents de Anthropic (requiere API key)
 ```
 
 Cambiar de proveedor es **cambiar tres líneas del `.env`**. El `agent-runner`
 y el sandbox no se tocan.
+
+**Dos procesos, no uno.** La API valida, persiste y encola; el worker ejecuta.
+La API arranca sin `LLM_API_KEY` y sin Docker — ver
+[ADR 0009](docs/adr/0009-la-api-no-ejecuta.md).
 
 ## Estado
 
@@ -49,8 +55,9 @@ y el sandbox no se tocan.
 | **0a** | Sandbox Docker aislado, con exec / write / read | ✅ verificado |
 | **0b** | Loop de agente cerrando una tarea end-to-end | ✅ verificado |
 | **1** | Orquestador NestJS: ticket + máquina de estados + traza | ✅ verificado |
-| **—** | Tests del dominio (20) + ADRs + specs | ✅ |
-| 1b | Async, reintentos, reaper y presupuestos — [spec 002](docs/specs/002-ejecucion-asincrona.md) | 📄 especificada |
+| **1b** | Async: cola, reaper por latido, presupuestos, DLQ — [spec 002](docs/specs/002-ejecucion-asincrona.md) | ✅ verificado |
+| **—** | Dashboard: tablero + traza en vivo | ✅ |
+| **—** | Tests (44) + 9 ADRs + 5 specs | ✅ |
 | 2 | Ramas y pull requests — [spec 003](docs/specs/003-pull-requests.md) | 📄 especificada |
 | 3 | Gates de calidad — [spec 004](docs/specs/004-gates-de-calidad.md) | 📄 especificada |
 | 4 | Multiagente: Tech Lead → Developer / Reviewer / QA | ⬜ |
@@ -65,7 +72,7 @@ Requiere **Docker Desktop corriendo** y Node 22+.
 
 ```bash
 npm install
-npm test             # 20 tests del dominio — sin base, sin Docker, sin LLM
+npm test             # 44 tests — sin base, sin Docker, sin Redis, sin LLM
 npm run smoke        # verifica el sandbox — no necesita ninguna key
 
 cp .env.example .env # completar LLM_API_KEY
@@ -74,11 +81,31 @@ npm run models       # lista los modelos que tu key habilita
 # Agente suelto, sin persistencia
 npm run run
 npm run run "tu tarea acá"
+```
 
-# Plataforma completa
-npm run db:up        # Postgres en Docker
+### Plataforma completa
+
+Postgres (5433) y Redis (6380) usan puertos corridos para no chocar con
+instancias locales. Los volúmenes sobreviven a `db:down`.
+
+```bash
+npm run db:up        # Postgres + Redis en Docker
 npm run db:migrate   # migraciones + regenera el cliente Prisma
+
+# tres procesos, cada uno en su terminal
 npm run api          # http://localhost:3000
+npm run worker       # consume la cola y barre corridas muertas
+npm run dashboard    # http://localhost:4000  (npm run dashboard:install la 1ª vez)
+```
+
+El dashboard reescribe `/api/*` hacia `:3000`, así que no hay CORS y la API no
+sabe que existe un frontend.
+
+Sin worker corriendo, la API sigue aceptando tickets: quedan en `ASSIGNED`
+esperando en la cola.
+
+```bash
+npm run dlq          # jobs que fallaron 3 veces: inspeccionar y reintentar
 ```
 
 ### API
@@ -88,13 +115,19 @@ npm run api          # http://localhost:3000
 curl -X POST localhost:3000/tickets -H "content-type: application/json" \
   -d '{"title":"Sumar","task":"Crea sum.mjs con tests y corré node --test"}'
 
-# ejecutar (síncrono: espera a que el agente termine)
+# ejecutar (asíncrono: 202 y el worker se encarga)
 curl -X POST localhost:3000/tickets/<id>/run
+# → { "ticketId": "...", "jobId": "..." }
 
 # consultar
 curl localhost:3000/tickets
 curl localhost:3000/tickets?status=DONE
+curl localhost:3000/tickets/<id>/runs
+curl "localhost:3000/tickets/<id>/runs/<runId>/events?after=0"
 ```
+
+La traza es append-only: `?after=<último seq>` trae sólo lo nuevo. Encolar dos
+veces el mismo ticket es idempotente (`jobId = ticketId`).
 
 ### Máquina de estados
 
@@ -106,6 +139,11 @@ BACKLOG → ASSIGNED → IN_PROGRESS → DONE
 
 Lista blanca de transiciones: todo lo que no esté declarado está prohibido.
 Ejecutar un ticket que ya está en `DONE` devuelve `409`.
+
+`ASSIGNED` significa "en la cola"; `IN_PROGRESS`, "un worker lo tomó y está
+latiendo". El claim lo hace el worker, no la API, para que el estado no mienta.
+Si el worker muere, el reaper cierra la corrida en ≤ 2 min con
+`outcome: 'abandoned'` y el ticket vuelve a `FAILED`, desde donde se reintenta.
 
 La key por defecto es de **Groq** (free tier, sin tarjeta):
 [console.groq.com/keys](https://console.groq.com/keys). Cualquier proveedor
@@ -121,10 +159,10 @@ El límite que muerde en un loop agéntico no es el de tokens sino el de
 ## Tests
 
 ```bash
-npm test        # 20 tests, ~700 ms
+npm test        # 44 tests, ~1.7 s
 ```
 
-Corren **sin base de datos, sin Docker y sin LLM**: la lógica de orquestación se
+Corren **sin base de datos, sin Docker, sin Redis y sin LLM**: la lógica de orquestación se
 verifica contra dobles de prueba. Ese es el retorno concreto de la arquitectura
 hexagonal, y la razón por la que los puertos valen su indirección.
 
@@ -132,6 +170,10 @@ hexagonal, y la razón por la que los puertos valen su indirección.
   exhaustiva sobre todo el producto cartesiano de estados.
 - `src/application/run-ticket.use-case.test.ts` — la orquestación: carreras
   entre workers, fallos del LLM, limpieza del sandbox, tolerancia del log.
+- `src/application/enqueue-ticket.use-case.test.ts` — qué estados se pueden
+  encolar, e idempotencia.
+- `src/application/reap-stale-runs.use-case.test.ts` — el umbral de latido.
+- `src/domain/agent-runner.test.ts` — los tres presupuestos y cuál corta primero.
 
 ## Documentación
 
@@ -139,8 +181,9 @@ Las decisiones y el comportamiento están en **[`docs/`](docs/README.md)**:
 
 - **[ADR](docs/README.md#decisiones-adr)** — por qué cada cosa es como es.
   Arquitectura hexagonal, proveedor agnóstico, el sandbox como única frontera,
-  lista blanca de transiciones, compare-and-set, traza append-only, y por qué
-  el veredicto no lo da el agente.
+  lista blanca de transiciones, compare-and-set, traza append-only, por qué
+  el veredicto no lo da el agente, por qué la vida de una corrida se mide con
+  latidos y no con relojes, y por qué la API no ejecuta agentes.
 - **[Specs](docs/README.md#comportamiento-spec)** — qué tiene que pasar, esté
   implementado o no. Incluye el diseño completo de PRs, gates de calidad y
   despliegue, que todavía no están construidos.
