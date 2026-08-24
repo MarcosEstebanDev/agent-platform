@@ -43,7 +43,9 @@ model AgentRun {
   model        String
   startedAt    DateTime  @default(now()) @map("started_at")
   finishedAt   DateTime? @map("finished_at")
-  /// completed | max_iterations | error
+  /// Ultimo latido del worker. Si se atrasa, el reaper cierra la corrida.
+  heartbeatAt  DateTime? @map("heartbeat_at")
+  /// completed | max_iterations | budget_exceeded | error | abandoned
   outcome      String?
   iterations   Int       @default(0)
   inputTokens  Int       @default(0) @map("input_tokens")
@@ -53,6 +55,8 @@ model AgentRun {
   events AgentEvent[]
 
   @@index([ticketId])
+  /// Para el barrido del reaper: corridas abiertas ordenadas por latido.
+  @@index([finishedAt, heartbeatAt])
   @@map("agent_runs")
 }
 

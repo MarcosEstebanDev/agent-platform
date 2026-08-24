@@ -1,141 +1,23 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import type { AgentEvent } from '../domain/agent-runner.js';
 import type { LlmPort, LlmResponse } from '../domain/ports/llm.port.js';
-import type { SandboxFactoryPort } from '../domain/ports/sandbox-factory.port.js';
-import type { ExecResult, SandboxPort } from '../domain/ports/sandbox.port.js';
-import type {
-  AgentRunSummary,
-  TicketRepositoryPort,
-} from '../domain/ports/ticket-repository.port.js';
-import { assertTransition, type Ticket, type TicketStatus } from '../domain/ticket.js';
+import {
+  FakeLlm,
+  FakeSandbox,
+  FakeSandboxFactory,
+  FakeTicketRepository,
+  textResponse,
+  toolResponse,
+} from './fakes.js';
 import { RunTicketUseCase } from './run-ticket.use-case.js';
 
 /**
  * Estos tests corren sin base de datos, sin Docker y sin LLM.
  *
- * Ese es el retorno concreto de la arquitectura hexagonal: la lógica de
- * orquestación —la parte que puede corromper estado— se verifica en
+ * Ese es el retorno concreto de la arquitectura hexagonal: la logica de
+ * orquestacion -la parte que puede corromper estado- se verifica en
  * milisegundos, contra dobles de prueba.
  */
-
-// ─── Dobles ──────────────────────────────────────────────────────────────
-
-class FakeTicketRepository implements TicketRepositoryPort {
-  private readonly tickets = new Map<string, Ticket>();
-  readonly events: Array<{ runId: string; seq: number; event: AgentEvent }> = [];
-  readonly finished: Array<{ runId: string; summary: AgentRunSummary }> = [];
-  private runCounter = 0;
-
-  seed(status: TicketStatus, id = 'T-1'): Ticket {
-    const ticket: Ticket = {
-      id,
-      title: 'test',
-      task: 'hacer algo',
-      status,
-      createdAt: new Date(),
-      updatedAt: new Date(),
-    };
-    this.tickets.set(id, ticket);
-    return ticket;
-  }
-
-  async create(input: { title: string; task: string }): Promise<Ticket> {
-    return this.seed('BACKLOG', `T-${this.tickets.size + 1}`);
-  }
-
-  async findById(id: string): Promise<Ticket | null> {
-    return this.tickets.get(id) ?? null;
-  }
-
-  async list(): Promise<Ticket[]> {
-    return [...this.tickets.values()];
-  }
-
-  /** Mismo contrato que Postgres: compare-and-set, null si no coincide. */
-  async transition(
-    id: string,
-    expectedFrom: TicketStatus,
-    to: TicketStatus,
-  ): Promise<Ticket | null> {
-    const ticket = this.tickets.get(id);
-    if (!ticket || ticket.status !== expectedFrom) return null;
-    // El doble también respeta la máquina de estados: si el use case
-    // intentara una transición ilegal, el test falla acá y no en producción.
-    assertTransition(expectedFrom, to);
-    const updated = { ...ticket, status: to, updatedAt: new Date() };
-    this.tickets.set(id, updated);
-    return updated;
-  }
-
-  async startRun(): Promise<{ id: string }> {
-    return { id: `RUN-${++this.runCounter}` };
-  }
-
-  async appendEvent(runId: string, seq: number, event: AgentEvent): Promise<void> {
-    this.events.push({ runId, seq, event });
-  }
-
-  async finishRun(runId: string, summary: AgentRunSummary): Promise<void> {
-    this.finished.push({ runId, summary });
-  }
-}
-
-class FakeLlm implements LlmPort {
-  readonly modelName = 'fake-model';
-  calls = 0;
-
-  constructor(private readonly scripted: Array<LlmResponse | Error>) {}
-
-  async complete(): Promise<LlmResponse> {
-    const next = this.scripted[this.calls++] ?? textResponse('sin más guion');
-    if (next instanceof Error) throw next;
-    return next;
-  }
-}
-
-class FakeSandbox implements SandboxPort {
-  started = 0;
-  stopped = 0;
-  readonly commands: string[] = [];
-
-  async start(): Promise<void> {
-    this.started++;
-  }
-  async exec(command: string): Promise<ExecResult> {
-    this.commands.push(command);
-    return { stdout: 'ok', stderr: '', exitCode: 0 };
-  }
-  async writeFile(): Promise<void> {}
-  async readFile(): Promise<string> {
-    return '';
-  }
-  async stop(): Promise<void> {
-    this.stopped++;
-  }
-}
-
-class FakeSandboxFactory implements SandboxFactoryPort {
-  readonly created: FakeSandbox[] = [];
-  create(): SandboxPort {
-    const sandbox = new FakeSandbox();
-    this.created.push(sandbox);
-    return sandbox;
-  }
-}
-
-function textResponse(text: string): LlmResponse {
-  return { text, toolCalls: [], stopReason: 'stop', usage: { input: 10, output: 5 } };
-}
-
-function toolResponse(command: string): LlmResponse {
-  return {
-    text: null,
-    toolCalls: [{ id: 'call-1', name: 'bash', arguments: { command } }],
-    stopReason: 'tool_calls',
-    usage: { input: 20, output: 8 },
-  };
-}
 
 function build(scripted: Array<LlmResponse | Error>) {
   const tickets = new FakeTicketRepository();
@@ -149,7 +31,7 @@ function build(scripted: Array<LlmResponse | Error>) {
   };
 }
 
-// ─── Tests ───────────────────────────────────────────────────────────────
+// ─── Ciclo de vida ──────────────────────────────────────────────────────────
 
 test('camino feliz: BACKLOG termina en DONE pasando por ASSIGNED', async () => {
   const { tickets, useCase } = build([toolResponse('echo hola'), textResponse('listo')]);
@@ -196,24 +78,22 @@ test('ticket inexistente devuelve not_found sin tocar el sandbox', async () => {
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.reason, 'not_found');
-  assert.equal(sandboxes.created.length, 0, 'no debería levantar un container');
+  assert.equal(sandboxes.created.length, 0, 'no deberia levantar un container');
 });
 
 test('un ticket en DONE no se puede reejecutar', async () => {
-  const { sandboxes, useCase } = build([]);
-  const { tickets } = build([]);
-  void tickets;
-  const repo = new FakeTicketRepository();
-  repo.seed('DONE');
-  const uc = new RunTicketUseCase(repo, new FakeLlm([]), sandboxes);
+  const { tickets, sandboxes, useCase } = build([]);
+  tickets.seed('DONE');
 
-  const result = await uc.execute('T-1');
+  const result = await useCase.execute('T-1');
 
   assert.equal(result.ok, false);
   if (result.ok) return;
   assert.equal(result.reason, 'invalid_status');
   assert.equal(sandboxes.created.length, 0);
 });
+
+// ─── Fallas ─────────────────────────────────────────────────────────────────
 
 test('si el LLM explota, el ticket termina en FAILED y no colgado', async () => {
   const { tickets, useCase } = build([new Error('502 del proveedor')]);
@@ -228,46 +108,38 @@ test('si el LLM explota, el ticket termina en FAILED y no colgado', async () => 
   assert.match(result.summary.error ?? '', /502/);
 });
 
-test('el sandbox se destruye SIEMPRE, también cuando la corrida falla', async () => {
+test('el sandbox se destruye SIEMPRE, tambien cuando la corrida falla', async () => {
   const { tickets, sandboxes, useCase } = build([new Error('boom')]);
   tickets.seed('BACKLOG');
 
   await useCase.execute('T-1');
 
   assert.equal(sandboxes.created.length, 1);
-  assert.equal(sandboxes.created[0]!.stopped, 1, 'container huérfano = RAM perdida');
+  assert.equal(sandboxes.created[0]!.stopped, 1, 'container huerfano = RAM perdida');
 });
 
 test('cada corrida usa un sandbox nuevo: un ticket no ve los archivos de otro', async () => {
-  const repo = new FakeTicketRepository();
-  const sandboxes = new FakeSandboxFactory();
-  const uc = new RunTicketUseCase(
-    repo,
-    new FakeLlm([textResponse('a'), textResponse('b')]),
-    sandboxes,
-  );
-  repo.seed('BACKLOG', 'T-1');
-  repo.seed('BACKLOG', 'T-2');
+  const { tickets, sandboxes, useCase } = build([textResponse('a'), textResponse('b')]);
+  tickets.seed('BACKLOG', 'T-1');
+  tickets.seed('BACKLOG', 'T-2');
 
-  await uc.execute('T-1');
-  await uc.execute('T-2');
+  await useCase.execute('T-1');
+  await useCase.execute('T-2');
 
   assert.equal(sandboxes.created.length, 2);
   assert.notEqual(sandboxes.created[0], sandboxes.created[1]);
 });
 
 test('si otro worker se adelanta, devuelve already_taken sin ejecutar nada', async () => {
-  const sandboxes = new FakeSandboxFactory();
-  const repo = new FakeTicketRepository();
-  repo.seed('ASSIGNED');
+  const { tickets, sandboxes, useCase } = build([]);
+  tickets.seed('ASSIGNED');
 
   // Simula la carrera: el compare-and-set del claim no encuentra el estado esperado.
-  const original = repo.transition.bind(repo);
-  repo.transition = async (id, from, to) =>
+  const original = tickets.transition.bind(tickets);
+  tickets.transition = async (id, from, to) =>
     from === 'ASSIGNED' && to === 'IN_PROGRESS' ? null : original(id, from, to);
 
-  const uc = new RunTicketUseCase(repo, new FakeLlm([]), sandboxes);
-  const result = await uc.execute('T-1');
+  const result = await useCase.execute('T-1');
 
   assert.equal(result.ok, false);
   if (result.ok) return;
@@ -276,20 +148,136 @@ test('si otro worker se adelanta, devuelve already_taken sin ejecutar nada', asy
 });
 
 test('un fallo al persistir un evento no mata la corrida', async () => {
-  const repo = new FakeTicketRepository();
-  repo.seed('BACKLOG');
-  repo.appendEvent = async () => {
-    throw new Error('base caída');
+  const { tickets, useCase } = build([textResponse('listo')]);
+  tickets.seed('BACKLOG');
+  tickets.appendEvent = async () => {
+    throw new Error('base caida');
   };
 
-  const uc = new RunTicketUseCase(
-    repo,
-    new FakeLlm([textResponse('listo')]),
-    new FakeSandboxFactory(),
-  );
-  const result = await uc.execute('T-1');
+  const result = await useCase.execute('T-1');
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
   assert.equal(result.ticket.status, 'DONE', 'el log es best-effort, no bloqueante');
+});
+
+// ─── Fase 1b: latido y presupuestos ─────────────────────────────────────────
+
+/** LLM que tarda, para que el intervalo de latido tenga tiempo de disparar. */
+class SlowLlm implements LlmPort {
+  readonly modelName = 'slow-model';
+  constructor(private readonly delayMs: number) {}
+  async complete(): Promise<LlmResponse> {
+    await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    return textResponse('listo');
+  }
+}
+
+test('reporta latido mientras la corrida esta en curso', async () => {
+  const tickets = new FakeTicketRepository();
+  tickets.seed('BACKLOG');
+  const useCase = new RunTicketUseCase(
+    tickets,
+    new SlowLlm(60),
+    new FakeSandboxFactory(),
+    {},
+    5, // heartbeat cada 5 ms
+  );
+
+  await useCase.execute('T-1');
+
+  assert.ok(
+    tickets.heartbeats.length >= 1,
+    'sin latido el reaper mataria una corrida viva',
+  );
+});
+
+test('el latido se corta al terminar: no sigue latiendo una corrida cerrada', async () => {
+  const tickets = new FakeTicketRepository();
+  tickets.seed('BACKLOG');
+  const useCase = new RunTicketUseCase(
+    tickets,
+    new FakeLlm([textResponse('listo')]),
+    new FakeSandboxFactory(),
+    {},
+    5,
+  );
+
+  await useCase.execute('T-1');
+  const alTerminar = tickets.heartbeats.length;
+  await new Promise((resolve) => setTimeout(resolve, 30));
+
+  assert.equal(tickets.heartbeats.length, alTerminar, 'el intervalo quedo vivo');
+});
+
+test('agotar el presupuesto de tokens deja el ticket en FAILED con el motivo', async () => {
+  const tickets = new FakeTicketRepository();
+  tickets.seed('BACKLOG');
+  const useCase = new RunTicketUseCase(
+    tickets,
+    // Una sola iteracion que consume mas que todo el presupuesto.
+    new FakeLlm([toolResponse('echo', { input: 60_000, output: 60_000 })]),
+    new FakeSandboxFactory(),
+    { maxTokens: 100_000 },
+  );
+
+  const result = await useCase.execute('T-1');
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.ticket.status, 'FAILED');
+  assert.equal(result.summary.outcome, 'budget_exceeded');
+  assert.match(result.summary.error ?? '', /tokens/);
+});
+
+test('el arranque del sandbox descuenta del presupuesto de tiempo', async () => {
+  // Sandbox que tarda en levantar mas que todo el presupuesto. Si el reloj
+  // arrancara dentro del loop, esta corrida terminaria bien y el techo de
+  // tiempo seria una promesa vacia.
+  class SandboxLento extends FakeSandbox {
+    override async start(): Promise<void> {
+      await new Promise((resolve) => setTimeout(resolve, 120));
+    }
+  }
+  const lentos = new FakeSandboxFactory();
+  lentos.create = () => {
+    const s = new SandboxLento();
+    lentos.created.push(s);
+    return s;
+  };
+
+  const tickets = new FakeTicketRepository();
+  tickets.seed('BACKLOG');
+  const useCase = new RunTicketUseCase(
+    tickets,
+    new FakeLlm([textResponse('listo')]),
+    lentos,
+    { maxWallClockMs: 50 },
+  );
+
+  const result = await useCase.execute('T-1');
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.summary.outcome, 'budget_exceeded');
+  assert.match(result.summary.error ?? '', /wall_clock/);
+});
+
+test('el ultimo evento persistido dice por que se corto', async () => {
+  const tickets = new FakeTicketRepository();
+  tickets.seed('BACKLOG');
+  const useCase = new RunTicketUseCase(
+    tickets,
+    new FakeLlm([toolResponse('echo', { input: 60_000, output: 60_000 })]),
+    new FakeSandboxFactory(),
+    { maxTokens: 100_000 },
+  );
+
+  await useCase.execute('T-1');
+
+  const ultimo = tickets.events.at(-1)!.event;
+  assert.equal(ultimo.type, 'done');
+  if (ultimo.type !== 'done') return;
+  assert.equal(ultimo.reason, 'budget_exceeded');
+  assert.equal(ultimo.budget, 'tokens');
 });

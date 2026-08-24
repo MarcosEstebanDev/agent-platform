@@ -1,4 +1,9 @@
-import { AgentRunner, type AgentEvent } from '../domain/agent-runner.js';
+import {
+  AgentRunner,
+  DEFAULT_BUDGET,
+  type AgentBudget,
+  type AgentEvent,
+} from '../domain/agent-runner.js';
 import type { LlmPort } from '../domain/ports/llm.port.js';
 import type { SandboxFactoryPort } from '../domain/ports/sandbox-factory.port.js';
 import type {
@@ -23,6 +28,9 @@ export class RunTicketUseCase {
     private readonly tickets: TicketRepositoryPort,
     private readonly llm: LlmPort,
     private readonly sandboxes: SandboxFactoryPort,
+    private readonly budget: Partial<AgentBudget> = {},
+    /** Cada cuanto se reporta el latido. Menos de la mitad del umbral del reaper. */
+    private readonly heartbeatMs = 30_000,
   ) {}
 
   async execute(
@@ -78,18 +86,43 @@ export class RunTicketUseCase {
       }
     };
 
+    // Latido. Mientras esto siga escribiendo, el reaper no toca la corrida.
+    //
+    // Es un intervalo y no un tick por evento a proposito: un solo comando
+    // puede tardar minutos sin emitir nada, y ese silencio no significa que
+    // el worker haya muerto.
+    const beat = setInterval(() => {
+      void this.tickets.heartbeat(run.id).catch(() => {
+        /* si falla un latido, el siguiente lo corrige */
+      });
+    }, this.heartbeatMs);
+    beat.unref();
+
+    // El reloj del presupuesto arranca ACA, no dentro del loop del agente.
+    // Levantar el container puede tardar segundos (y bajarse una imagen,
+    // minutos): si no contaran, "10 minutos de presupuesto" seria en realidad
+    // "10 minutos mas lo que tarde Docker", que no es un techo de nada.
+    const runStartedAt = Date.now();
+
     let summary: AgentRunSummary;
     try {
       await sandbox.start();
-      const result = await new AgentRunner(this.llm, sandbox).run(
-        claimed.task,
-        (event) => void persist(event),
-      );
+
+      const techo = this.budget.maxWallClockMs ?? DEFAULT_BUDGET.maxWallClockMs;
+      const restante = Math.max(techo - (Date.now() - runStartedAt), 0);
+
+      const result = await new AgentRunner(this.llm, sandbox, {
+        ...this.budget,
+        maxWallClockMs: restante,
+      }).run(claimed.task, (event) => void persist(event));
       summary = {
         outcome: result.reason,
         iterations: result.iterations,
         inputTokens: result.usage.input,
         outputTokens: result.usage.output,
+        // Cortar por presupuesto no es un fallo del agente, pero sin dejar
+        // constancia del motivo el FAILED queda inexplicable en el dashboard.
+        error: result.budget ? `presupuesto agotado: ${result.budget}` : undefined,
       };
     } catch (err) {
       summary = {
@@ -100,6 +133,7 @@ export class RunTicketUseCase {
         error: err instanceof Error ? err.message : String(err),
       };
     } finally {
+      clearInterval(beat);
       await sandbox.stop();
     }
 

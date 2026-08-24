@@ -17,10 +17,40 @@ export type AgentEvent =
   | { type: 'text'; text: string }
   | { type: 'tool_call'; name: string; args: Record<string, unknown> }
   | { type: 'tool_result'; name: string; ok: boolean; preview: string }
-  | { type: 'done'; reason: 'completed' | 'max_iterations' };
+  | {
+      type: 'done';
+      reason: AgentStopReason;
+      /** Cual de los tres presupuestos se agoto. Solo en 'budget_exceeded'. */
+      budget?: ExceededBudget;
+    };
+
+export type AgentStopReason = 'completed' | 'max_iterations' | 'budget_exceeded';
+
+export type ExceededBudget = 'wall_clock' | 'tokens';
+
+/**
+ * Tres limites independientes: el que se agote primero corta la corrida.
+ *
+ * Son tres y no uno porque miden cosas distintas. Un agente enroscado en un
+ * loop corto agota iteraciones; uno esperando un comando lento agota tiempo;
+ * uno arrastrando un transcript gigante agota tokens. Cubrir solo uno deja
+ * las otras dos formas de quemar plata abiertas.
+ */
+export interface AgentBudget {
+  maxIterations: number;
+  maxWallClockMs: number;
+  maxTokens: number;
+}
+
+export const DEFAULT_BUDGET: AgentBudget = {
+  maxIterations: 25,
+  maxWallClockMs: 10 * 60_000,
+  maxTokens: 100_000,
+};
 
 export interface AgentResult {
-  reason: 'completed' | 'max_iterations';
+  reason: AgentStopReason;
+  budget?: ExceededBudget;
   iterations: number;
   usage: { input: number; output: number };
   transcript: LlmMessage[];
@@ -77,11 +107,17 @@ const TOOLS: LlmToolDefinition[] = [
 ];
 
 export class AgentRunner {
+  private readonly budget: AgentBudget;
+
   constructor(
     private readonly llm: LlmPort,
     private readonly sandbox: SandboxPort,
-    private readonly maxIterations = 25,
-  ) {}
+    budget: Partial<AgentBudget> = {},
+    /** Inyectable para poder testear el corte por tiempo sin esperar 10 minutos. */
+    private readonly now: () => number = Date.now,
+  ) {
+    this.budget = { ...DEFAULT_BUDGET, ...budget };
+  }
 
   async run(
     task: string,
@@ -92,8 +128,15 @@ export class AgentRunner {
       { role: 'user', content: task },
     ];
     const usage = { input: 0, output: 0 };
+    const startedAt = this.now();
 
-    for (let i = 1; i <= this.maxIterations; i++) {
+    for (let i = 1; i <= this.budget.maxIterations; i++) {
+      // El corte por tiempo se chequea ANTES de gastar otra llamada, no despues:
+      // no tiene sentido pagar un request cuyo resultado ya no se va a usar.
+      if (this.now() - startedAt >= this.budget.maxWallClockMs) {
+        return this.cutByBudget('wall_clock', i - 1, usage, messages, onEvent);
+      }
+
       const res = await this.llm.complete({ messages, tools: TOOLS });
       usage.input += res.usage.input;
       usage.output += res.usage.output;
@@ -110,6 +153,12 @@ export class AgentRunner {
       if (res.toolCalls.length === 0) {
         onEvent({ type: 'done', reason: 'completed' });
         return { reason: 'completed', iterations: i, usage, transcript: messages };
+      }
+
+      // Se chequea despues del corte por 'completed': si el agente ya termino,
+      // haber pasado el techo de tokens no convierte un exito en una falla.
+      if (usage.input + usage.output >= this.budget.maxTokens) {
+        return this.cutByBudget('tokens', i, usage, messages, onEvent);
       }
 
       // El protocolo exige una respuesta por CADA tool call. Si falta una,
@@ -137,10 +186,25 @@ export class AgentRunner {
     onEvent({ type: 'done', reason: 'max_iterations' });
     return {
       reason: 'max_iterations',
-      iterations: this.maxIterations,
+      iterations: this.budget.maxIterations,
       usage,
       transcript: messages,
     };
+  }
+
+  /**
+   * Cortar por presupuesto NO es un error del agente: es una decision del
+   * orquestador. Por eso emite un 'done' con motivo, y no lanza.
+   */
+  private cutByBudget(
+    budget: ExceededBudget,
+    iterations: number,
+    usage: { input: number; output: number },
+    transcript: LlmMessage[],
+    onEvent: (event: AgentEvent) => void,
+  ): AgentResult {
+    onEvent({ type: 'done', reason: 'budget_exceeded', budget });
+    return { reason: 'budget_exceeded', budget, iterations, usage, transcript };
   }
 
   /**

@@ -1,60 +1,55 @@
-import { Module } from '@nestjs/common';
-import { RunTicketUseCase } from '../application/run-ticket.use-case.js';
-import type { LlmPort } from '../domain/ports/llm.port.js';
-import type { SandboxFactoryPort } from '../domain/ports/sandbox-factory.port.js';
+import { Inject, Injectable, Module, type OnApplicationShutdown } from '@nestjs/common';
+import { EnqueueTicketUseCase } from '../application/enqueue-ticket.use-case.js';
+import type { QueuePort } from '../domain/ports/queue.port.js';
 import type { TicketRepositoryPort } from '../domain/ports/ticket-repository.port.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
-import { OpenAiCompatibleAdapter } from '../infrastructure/llm/openai-compatible.adapter.js';
 import {
   createPrismaClient,
   requireDatabaseUrl,
 } from '../infrastructure/persistence/prisma-client.factory.js';
 import { PrismaTicketRepository } from '../infrastructure/persistence/prisma-ticket.repository.js';
-import { DockerSandboxFactory } from '../infrastructure/sandbox/docker-sandbox.factory.js';
+import { BullMqQueueAdapter } from '../infrastructure/queue/bullmq-queue.adapter.js';
 import { TicketsController } from './tickets.controller.js';
-import {
-  LLM,
-  PRISMA,
-  RUN_TICKET,
-  SANDBOX_FACTORY,
-  TICKET_REPOSITORY,
-} from './tokens.js';
+import { ENQUEUE_TICKET, PRISMA, QUEUE, TICKET_REPOSITORY } from './tokens.js';
 
 /**
  * Composition root de la API.
  *
- * Es el único lugar donde se nombran los adapters concretos. Todo lo de
- * arriba (controller) y lo de abajo (dominio, casos de uso) sólo conoce
- * puertos. Cambiar de proveedor de LLM o de sandbox se hace acá.
+ * Desde la fase 1b la API NO conoce el LLM ni el sandbox: solo valida, guarda
+ * y encola. Eso significa que puede arrancar sin API key y sin Docker, y que
+ * un agente enroscado no puede degradarla. El trabajo pesado vive en
+ * `src/worker/main.ts`, que tiene su propio composition root.
  */
+
+/**
+ * Nest sabe apagar cosas; la infraestructura no tiene por que saber que existe
+ * Nest. Este wrapper es la unica pieza que conoce a los dos.
+ *
+ * Sin esto, el proceso no termina con Ctrl+C: la conexion a Redis mantiene
+ * vivo el event loop.
+ */
+@Injectable()
+export class QueueShutdown implements OnApplicationShutdown {
+  constructor(@Inject(QUEUE) private readonly queue: QueuePort) {}
+
+  async onApplicationShutdown(): Promise<void> {
+    const closable = this.queue as { close?: () => Promise<void> };
+    await closable.close?.();
+  }
+}
+
 @Module({
   controllers: [TicketsController],
   providers: [
+    QueueShutdown,
     {
       provide: PRISMA,
       useFactory: () => createPrismaClient(requireDatabaseUrl()),
     },
     {
-      provide: LLM,
-      useFactory: (): LlmPort => {
-        const { LLM_BASE_URL, LLM_API_KEY, LLM_MODEL } = process.env;
-        if (!LLM_BASE_URL || !LLM_API_KEY) {
-          throw new Error('Faltan LLM_BASE_URL / LLM_API_KEY en .env');
-        }
-        return new OpenAiCompatibleAdapter({
-          baseUrl: LLM_BASE_URL,
-          apiKey: LLM_API_KEY,
-          model: LLM_MODEL ?? 'openai/gpt-oss-120b',
-        });
-      },
-    },
-    {
-      provide: SANDBOX_FACTORY,
-      useFactory: (): SandboxFactoryPort =>
-        new DockerSandboxFactory({
-          image: process.env.SANDBOX_IMAGE,
-          network: process.env.SANDBOX_NETWORK === 'bridge' ? 'bridge' : 'none',
-        }),
+      provide: QUEUE,
+      useFactory: (): QueuePort =>
+        new BullMqQueueAdapter(process.env.REDIS_URL ?? 'redis://localhost:6379'),
     },
     {
       provide: TICKET_REPOSITORY,
@@ -63,13 +58,10 @@ import {
       inject: [PRISMA],
     },
     {
-      provide: RUN_TICKET,
-      useFactory: (
-        tickets: TicketRepositoryPort,
-        llm: LlmPort,
-        sandboxes: SandboxFactoryPort,
-      ) => new RunTicketUseCase(tickets, llm, sandboxes),
-      inject: [TICKET_REPOSITORY, LLM, SANDBOX_FACTORY],
+      provide: ENQUEUE_TICKET,
+      useFactory: (tickets: TicketRepositoryPort, queue: QueuePort) =>
+        new EnqueueTicketUseCase(tickets, queue),
+      inject: [TICKET_REPOSITORY, QUEUE],
     },
   ],
 })

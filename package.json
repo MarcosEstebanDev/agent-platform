@@ -14,6 +14,11 @@
     "models": "tsx --env-file=.env src/models.ts",
     "run": "tsx --env-file=.env src/run.ts",
     "api": "tsx --env-file=.env src/api/main.ts",
+    "worker": "tsx --env-file=.env src/worker/main.ts",
+    "dlq": "tsx --env-file=.env src/dlq.ts",
+    "dashboard": "npm --prefix apps/dashboard run dev",
+    "dashboard:install": "npm --prefix apps/dashboard install",
+    "dashboard:build": "npm --prefix apps/dashboard run build",
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test src/domain/*.test.ts src/application/*.test.ts"
   },
@@ -30,6 +35,8 @@
     "@nestjs/platform-express": "^11.2.1",
     "@prisma/adapter-pg": "^7.9.1",
     "@prisma/client": "^7.9.1",
+    "bullmq": "^6.2.0",
+    "ioredis": "^6.0.0",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.2"
   }

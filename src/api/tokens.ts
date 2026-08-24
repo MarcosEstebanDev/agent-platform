@@ -6,7 +6,6 @@
  * (Además evita depender de emitDecoratorMetadata, que esbuild no emite.)
  */
 export const PRISMA = Symbol('PRISMA');
-export const LLM = Symbol('LLM');
-export const SANDBOX_FACTORY = Symbol('SANDBOX_FACTORY');
 export const TICKET_REPOSITORY = Symbol('TICKET_REPOSITORY');
-export const RUN_TICKET = Symbol('RUN_TICKET');
+export const QUEUE = Symbol('QUEUE');
+export const ENQUEUE_TICKET = Symbol('ENQUEUE_TICKET');
