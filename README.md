@@ -6,6 +6,30 @@ organiza tickets, delega implementación, y el ciclo cierra con PR, tests y depl
 **Agnóstica del proveedor.** El dominio no sabe qué LLM ni qué sandbox hay
 debajo — eso vive en adapters intercambiables.
 
+## Lo interesante
+
+**Esto no es un proyecto sobre LLMs.** Es un proyecto sobre orquestar trabajo
+distribuido y poco confiable, donde el que ejecuta puede morir a la mitad y
+nadie avisa. El LLM es apenas el worker; casi todo el código es estado durable,
+idempotencia, límites y reintentos.
+
+Los problemas concretos que resuelve, y dónde está la respuesta:
+
+| Problema | Cómo se resuelve | Dónde |
+|---|---|---|
+| Un worker muere en medio de una corrida y nadie lo notifica | Latido periódico + un reaper que cierra lo que dejó de latir. El peor caso es **umbral + intervalo de barrido**, no el umbral solo: 90 s + 30 s = 2 min acotados por diseño | [ADR 0008](docs/adr/0008-liveness-por-latido.md) |
+| El estado guardado miente sobre la realidad | El claim `ASSIGNED→IN_PROGRESS` lo hace el **worker**, no la API. Si lo hiciera la API, un ticket encolado y jamás tomado figuraría "en progreso" sin nadie corriendo — y el reaper perdería su única prueba de muerte | [ADR 0009](docs/adr/0009-la-api-no-ejecuta.md) |
+| El mismo trabajo se encola dos veces | `jobId = ticketId`: idempotente por construcción, no por chequeo | [spec 002](docs/specs/002-ejecucion-asincrona.md) |
+| Una corrida que no termina nunca | Tres presupuestos (iteraciones, tokens, reloj) y el que corte primero gana. El reloj arranca **antes** de levantar el container, porque levantarlo también cuesta | `domain/agent-runner.ts` |
+| El trabajo se pierde al destruir el sandbox | Se exporta el workspace en base64 —el escapeo deja de ser una categoría de bug— con los techos aplicados *dentro* del shell, y se persiste **antes** de `stop()` | `infrastructure/sandbox/` |
+| Containers huérfanos cuando el worker cae | Cada container lleva el id de su corrida como label; un janitor destruye aquellos que la base da por cerrados. Reaper y janitor **no se conocen**: se coordinan por la base | [ADR 0011](docs/adr/0011-identidad-del-container.md) |
+| Que no haya credenciales dentro del sandbox | Git no entra. Clonar, commitear y pushear pasan del lado del orquestador, así que no hay token adentro que proteger | [ADR 0010](docs/adr/0010-git-fuera-del-sandbox.md) |
+| Probar todo esto sin levantar nada | Puertos + dobles: **70 tests en ~450 ms**, sin base, sin Docker, sin Redis y sin LLM | [Tests](#tests) |
+
+> Proyecto de portfolio. El objetivo es mostrar el **criterio detrás de cada
+> decisión** —documentado como ADRs, incluidas las veces que el diseño chocó
+> con la realidad y hubo que corregirlo— antes que la cantidad de features.
+
 ## Arquitectura
 
 ```
