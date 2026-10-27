@@ -1,5 +1,6 @@
 import { NewTicketForm } from '@/components/new-ticket-form';
-import { ApiUnreachableError, listTickets, STATUSES, type Ticket } from '@/lib/api';
+import { StatusBadge } from '@/components/badges';
+import { ApiUnreachableError, COLUMNS, listTickets, type Ticket } from '@/lib/api';
 
 // El tablero refleja estado que cambia solo (los workers mueven tickets sin
 // que nadie navegue). Cachearlo mostraria un tablero viejo con cara de actual.
@@ -33,12 +34,12 @@ export default async function Home() {
       {error ? <p className="error-box">{error}</p> : null}
 
       <div className="board">
-        {STATUSES.map((status) => {
-          const columna = tickets.filter((t) => t.status === status);
+        {COLUMNS.map(({ label, statuses }) => {
+          const columna = tickets.filter((t) => statuses.includes(t.status));
           return (
-            <div className="column" key={status}>
+            <div className="column" key={label}>
               <div className="column-head">
-                <span>{status}</span>
+                <span>{label}</span>
                 <span>{columna.length}</span>
               </div>
               <div className="column-body">
@@ -52,7 +53,9 @@ export default async function Home() {
                     <div className="card-title">{ticket.title}</div>
                     <div className="card-meta">
                       {ticket.id.slice(0, 8)} · {formatoRelativo(ticket.updatedAt)}
+                      {ticket.prNumber ? ` · PR #${ticket.prNumber}` : ''}
                     </div>
+                    {statuses.length > 1 ? <StatusBadge status={ticket.status} /> : null}
                   </a>
                 ))}
                 {columna.length === 0 ? <div className="empty">vacio</div> : null}

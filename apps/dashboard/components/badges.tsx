@@ -6,6 +6,11 @@ const STATUS_TONE: Record<TicketStatus, Tone> = {
   BACKLOG: 'idle',
   ASSIGNED: 'warn',
   IN_PROGRESS: 'run',
+  PR_OPEN: 'run',
+  CHECKS_RUNNING: 'run',
+  CHECKS_PASSED: 'ok',
+  // warn y no err: el ciclo de correccion es el sistema funcionando, no roto.
+  CHANGES_REQUESTED: 'warn',
   DONE: 'ok',
   FAILED: 'err',
 };

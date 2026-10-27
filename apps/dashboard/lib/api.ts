@@ -8,14 +8,33 @@
 
 export const API_URL = process.env.API_URL ?? 'http://localhost:3000';
 
-export type TicketStatus = 'BACKLOG' | 'ASSIGNED' | 'IN_PROGRESS' | 'DONE' | 'FAILED';
+export type TicketStatus =
+  | 'BACKLOG'
+  | 'ASSIGNED'
+  | 'IN_PROGRESS'
+  | 'PR_OPEN'
+  | 'CHECKS_RUNNING'
+  | 'CHECKS_PASSED'
+  | 'CHANGES_REQUESTED'
+  | 'DONE'
+  | 'FAILED';
 
-export const STATUSES: readonly TicketStatus[] = [
-  'BACKLOG',
-  'ASSIGNED',
-  'IN_PROGRESS',
-  'DONE',
-  'FAILED',
+/**
+ * Columnas del tablero. Los cuatro estados del PR van juntos en "En review":
+ * nueve columnas no entran en una pantalla, y para quien mira el tablero la
+ * pregunta es una sola -¿esta esperando a CI?-. El estado exacto lo dice el
+ * badge de cada tarjeta.
+ */
+export const COLUMNS: ReadonlyArray<{ label: string; statuses: readonly TicketStatus[] }> = [
+  { label: 'BACKLOG', statuses: ['BACKLOG'] },
+  { label: 'ASSIGNED', statuses: ['ASSIGNED'] },
+  { label: 'IN_PROGRESS', statuses: ['IN_PROGRESS'] },
+  {
+    label: 'EN REVIEW',
+    statuses: ['PR_OPEN', 'CHECKS_RUNNING', 'CHECKS_PASSED', 'CHANGES_REQUESTED'],
+  },
+  { label: 'DONE', statuses: ['DONE'] },
+  { label: 'FAILED', statuses: ['FAILED'] },
 ];
 
 export type RunOutcome =
@@ -30,6 +49,12 @@ export interface Ticket {
   title: string;
   task: string;
   status: TicketStatus;
+  branch: string | null;
+  prNumber: number | null;
+  prUrl: string | null;
+  gateAttempts: number;
+  gateFeedback: string | null;
+  statusReason: string | null;
   createdAt: string;
   updatedAt: string;
 }

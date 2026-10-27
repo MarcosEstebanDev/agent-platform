@@ -57,8 +57,31 @@ export default async function TicketPage({ params }: { params: Promise<{ id: str
         </div>
       </div>
 
+      {ticket.prUrl || ticket.statusReason ? (
+        <>
+          <h2>Entrega</h2>
+          <p className="card-meta">
+            {ticket.prUrl ? (
+              <a href={ticket.prUrl} target="_blank" rel="noreferrer">
+                PR #{ticket.prNumber}
+              </a>
+            ) : null}
+            {ticket.branch ? ` · ${ticket.branch}` : ''}
+            {ticket.gateAttempts > 0 ? ` · ${ticket.gateAttempts} rechazo(s) de CI` : ''}
+          </p>
+          {ticket.statusReason ? <p className="error-box">{ticket.statusReason}</p> : null}
+        </>
+      ) : null}
+
       <h2>Instruccion del agente</h2>
       <pre className="task-box">{ticket.task}</pre>
+
+      {ticket.gateFeedback ? (
+        <>
+          <h2>Feedback de CI para el proximo intento</h2>
+          <pre className="task-box">{ticket.gateFeedback}</pre>
+        </>
+      ) : null}
 
       <h2>Corridas</h2>
       <RunsPanel ticketId={ticket.id} runs={runs} live={enCurso} />
