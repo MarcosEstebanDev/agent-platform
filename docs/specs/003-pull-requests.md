@@ -1,9 +1,12 @@
 # Spec 003 — Ramas y pull requests
 
-**Fase:** 2 · **Estado:** Prerequisito implementado, PRs pendientes
+**Fase:** 2 · **Estado:** Implementada (2026-10-27) · Verificación contra GitHub real pendiente
 
-> El rescate del trabajo (la sección "El problema a resolver primero") está
-> hecho y verificado. Todo lo que sigue —ramas, push, PR— no.
+> Implementada con un desvío en el *cómo*: el commit y el PR se arman con la API
+> REST de GitHub, sin clonar y sin el servidor MCP. Ver
+> [ADR 0012](../adr/0012-pull-requests-por-la-api-rest.md). Las secciones
+> "Dos mecanismos" y "Puerto nuevo" quedan como el diseño original; lo
+> construido está en el ADR y en `src/domain/ports/vcs.port.ts`.
 
 ## Objetivo
 
@@ -174,11 +177,31 @@ sobre sí mismo ([ADR 0007](../adr/0007-el-veredicto-no-es-del-agente.md)).
 
 ## Criterio de aceptación
 
+Verificado contra dobles (`FakeVcs`, `fetch` falso). La corrida real contra un
+repo de GitHub está pendiente: ver "Verificación real" en el README.
+
 - [x] El trabajo se persiste antes de destruir el container.
       → `exportFiles()` corre en el `finally`, antes de `stop()`; el test
       verifica el ORDEN, no sólo que ambos pasen.
-- [ ] Un ticket ejecutado produce una rama `feature/TICKET-<id>` con commits.
-- [ ] Se crea el PR y el ticket pasa a `PR_OPEN`.
-- [ ] El cuerpo del PR se arma desde la traza, no desde el texto del agente.
-- [ ] Si el PR falla y el push no, reintentar no reejecuta al agente.
-- [ ] El PAT no aparece en ninguna fila de `agent_events`.
+- [x] Un ticket ejecutado produce una rama `feature/TICKET-<id>` con commits.
+      → `open-pull-request.use-case.test.ts`; rama ajena con el mismo nombre
+      → sufijo `-2`.
+- [x] Se crea el PR y el ticket pasa a `PR_OPEN`.
+- [x] El cuerpo del PR se arma desde la traza, no desde el texto del agente.
+      → `buildPullRequestBody` ignora los eventos `text`; el test le hace decir
+      "Soy un genio" al agente y verifica que no llegue al PR.
+- [x] Si el PR falla y el push no, reintentar no reejecuta al agente.
+      → la rama se guarda antes del PR; `POST /tickets/:id/pull-request`
+      reintenta con el artefacto ya guardado: una rama, un commit.
+- [x] El PAT no aparece en ninguna fila de `agent_events`.
+      → el flujo del PR no escribe en la traza, y todo mensaje de error se tacha
+      dos veces (adapter y caso de uso) antes de persistirse en el ticket.
+
+Desvíos de los modos de falla:
+
+- "Clonar falla" → no hay clon. Lo equivalente es `checkAccess` sobre el repo,
+  que corre **antes de crear la corrida**: ni un token ni un container.
+- "PR falla pero el push salió" → IN_PROGRESS con la rama y el motivo en
+  `status_reason`. Lo mismo si GitHub está caído al pushear.
+- Una corrida completada **sin archivos** pasa a FAILED con motivo: sin
+  artefacto no hay PR posible (lo que ADR 0010 dejaba para esta fase).

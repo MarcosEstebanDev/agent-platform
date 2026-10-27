@@ -1,6 +1,10 @@
 # Spec 004 — Gates de calidad
 
-**Fase:** 3 · **Estado:** Especificada
+**Fase:** 3 · **Estado:** Implementada (2026-10-27) · Verificación contra GitHub real pendiente
+
+> El veredicto se decide en el dominio sobre los checks crudos, no en el
+> adapter, y SonarCloud entra como un check más. Ver
+> [ADR 0013](../adr/0013-el-veredicto-de-los-gates-vive-en-el-dominio.md).
 
 ## Objetivo
 
@@ -121,9 +125,28 @@ y el ticket pasa a `PR_OPEN`. La decisión se muda a un caso de uso nuevo,
 
 ## Criterio de aceptación
 
-- [ ] Un PR con tests en verde lleva el ticket a `DONE` sin intervención.
-- [ ] Un PR con tests en rojo lo lleva a `CHANGES_REQUESTED`, no a `DONE`.
-- [ ] El feedback de los checks fallidos llega al `task` del reintento.
-- [ ] Ignorar el webhook a propósito: el poller cierra el ticket igual.
-- [ ] Tres ciclos fallidos terminan en `FAILED`, no en un bucle infinito.
-- [ ] Ningún `DONE` se emite sin al menos un check verde asociado.
+Verificado contra dobles (`FakeQualityGate`) y, el webhook, con firmas HMAC
+reales sobre HTTP. La corrida contra un PR real con GitHub Actions está
+pendiente: ver "Verificación real" en el README.
+
+- [x] Un PR con tests en verde lleva el ticket a `DONE` sin intervención.
+- [x] Un PR con tests en rojo lo lleva a `CHANGES_REQUESTED`, no a `DONE`.
+      → y de ahí a `ASSIGNED`, reencolado: el agente reintenta solo.
+- [x] El feedback de los checks fallidos llega al `task` del reintento.
+      → se guarda en `gate_feedback` y se compone con el task original
+      (`composeTask`) en vez de reescribirlo, para no apilar intentos.
+- [x] Ignorar el webhook a propósito: el poller cierra el ticket igual.
+- [x] Tres ciclos fallidos terminan en `FAILED`, no en un bucle infinito.
+      → `status_reason = 'gates_exhausted'`. Reencolar a mano desde FAILED
+      devuelve los tres intentos.
+- [x] Ningún `DONE` se emite sin al menos un check verde asociado.
+      → regla de `evaluateChecks`, y además la lista blanca: el único camino a
+      DONE es `CHECKS_PASSED → DONE`.
+
+Desvíos:
+
+- El estado se guarda en la columna `status_reason` del ticket, no como
+  `outcome` de la corrida: `gates_exhausted` le pasa al ticket, no a una
+  corrida (la última terminó bien; lo que falló es CI).
+- El webhook acepta `check_suite.completed` **y** `check_run.completed`:
+  SonarCloud publica check runs sueltos. Evaluar de más es inocuo.
