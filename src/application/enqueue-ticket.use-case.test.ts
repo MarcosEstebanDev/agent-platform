@@ -113,3 +113,16 @@ test('reintentar despues de que la cola vuelve funciona sin tocar el ticket', as
   assert.equal(result.ok, true);
   assert.deepEqual(queue.enqueued, ['T-1']);
 });
+
+test('reintentar a mano un FAILED por gates le da tres intentos nuevos', async () => {
+  // gates_exhausted pide un humano. Cuando el humano reintenta, no tiene
+  // sentido que el primer rojo lo vuelva a mandar a FAILED.
+  const { tickets, useCase } = build();
+  tickets.seed('FAILED', 'T-1', { gateAttempts: 3, statusReason: 'gates_exhausted' });
+
+  await useCase.execute('T-1');
+
+  const ticket = await tickets.findById('T-1');
+  assert.equal(ticket?.gateAttempts, 0);
+  assert.equal(ticket?.statusReason, null);
+});

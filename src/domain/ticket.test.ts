@@ -8,7 +8,17 @@ import {
   type TicketStatus,
 } from './ticket.js';
 
-const ALL: TicketStatus[] = ['BACKLOG', 'ASSIGNED', 'IN_PROGRESS', 'DONE', 'FAILED'];
+const ALL: TicketStatus[] = [
+  'BACKLOG',
+  'ASSIGNED',
+  'IN_PROGRESS',
+  'PR_OPEN',
+  'CHECKS_RUNNING',
+  'CHECKS_PASSED',
+  'CHANGES_REQUESTED',
+  'DONE',
+  'FAILED',
+];
 
 /**
  * Toda transición que la plataforma permite, declarada una sola vez.
@@ -19,8 +29,16 @@ const PERMITIDAS: ReadonlyArray<[TicketStatus, TicketStatus]> = [
   ['BACKLOG', 'ASSIGNED'],
   ['ASSIGNED', 'IN_PROGRESS'],
   ['ASSIGNED', 'BACKLOG'],
-  ['IN_PROGRESS', 'DONE'],
+  ['IN_PROGRESS', 'PR_OPEN'],
   ['IN_PROGRESS', 'FAILED'],
+  ['PR_OPEN', 'CHECKS_RUNNING'],
+  ['PR_OPEN', 'FAILED'],
+  ['CHECKS_RUNNING', 'CHECKS_PASSED'],
+  ['CHECKS_RUNNING', 'CHANGES_REQUESTED'],
+  ['CHECKS_RUNNING', 'FAILED'],
+  ['CHECKS_PASSED', 'DONE'],
+  ['CHANGES_REQUESTED', 'ASSIGNED'],
+  ['CHANGES_REQUESTED', 'FAILED'],
   ['FAILED', 'ASSIGNED'],
 ];
 
@@ -61,6 +79,15 @@ test('DONE es terminal: nada sale de ahí', () => {
 test('FAILED NO es terminal: se puede reintentar vía ASSIGNED', () => {
   assert.equal(isTerminal('FAILED'), false);
   assert.equal(canTransition('FAILED', 'ASSIGNED'), true);
+});
+
+test('el agente no puede llevar un ticket a DONE: solo los checks verdes', () => {
+  // ADR 0007 y spec 004: el unico camino a DONE pasa por CHECKS_PASSED, que
+  // solo escribe la evaluacion de los gates. IN_PROGRESS es el estado del
+  // agente, y desde ahi DONE no existe.
+  const haciaDone = ALL.filter((from) => canTransition(from, 'DONE'));
+  assert.deepEqual(haciaDone, ['CHECKS_PASSED']);
+  assert.equal(canTransition('IN_PROGRESS', 'DONE'), false);
 });
 
 test('no se puede saltear ASSIGNED yendo de BACKLOG a IN_PROGRESS', () => {

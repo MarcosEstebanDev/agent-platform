@@ -44,6 +44,13 @@ export class EnqueueTicketUseCase {
       if (!assigned) {
         return { ok: false, reason: 'already_taken', detail: 'Otro proceso movio el ticket' };
       }
+      // Un reintento a mano es una decision humana sobre un ticket trabado
+      // (por ejemplo, gates_exhausted): arranca con los tres intentos de los
+      // gates enteros. El feedback se conserva: sigue siendo lo ultimo que
+      // dijo CI.
+      if (ticket.status === 'FAILED') {
+        await this.tickets.updateDelivery(ticket.id, { gateAttempts: 0, statusReason: null });
+      }
     } else if (ticket.status !== 'ASSIGNED') {
       return {
         ok: false,

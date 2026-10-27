@@ -24,7 +24,20 @@ import type {
   StoredArtifact,
   TicketRepositoryPort,
 } from '../domain/ports/ticket-repository.port.js';
-import { assertTransition, type Ticket, type TicketStatus } from '../domain/ticket.js';
+import { OpenPullRequestUseCase } from './open-pull-request.use-case.js';
+import type { CheckRun, QualityGatePort } from '../domain/ports/quality-gate.port.js';
+import {
+  VcsError,
+  type CommitFile,
+  type PullRequestRef,
+  type VcsPort,
+} from '../domain/ports/vcs.port.js';
+import {
+  assertTransition,
+  type Ticket,
+  type TicketDelivery,
+  type TicketStatus,
+} from '../domain/ticket.js';
 
 /**
  * Dobles de prueba compartidos.
@@ -56,12 +69,20 @@ export class FakeTicketRepository implements TicketRepositoryPort {
 
   constructor(private readonly now: () => number = Date.now) {}
 
-  seed(status: TicketStatus, id = 'T-1'): Ticket {
+  seed(status: TicketStatus, id = 'T-1', delivery: Partial<TicketDelivery> = {}): Ticket {
     const ticket: Ticket = {
       id,
       title: 'test',
       task: 'hacer algo',
       status,
+      branch: null,
+      prNumber: null,
+      prUrl: null,
+      gateAttempts: 0,
+      gateFeedback: null,
+      checksStartedAt: null,
+      statusReason: null,
+      ...delivery,
       createdAt: new Date(this.now()),
       updatedAt: new Date(this.now()),
     };
@@ -93,8 +114,8 @@ export class FakeTicketRepository implements TicketRepositoryPort {
     return this.tickets.get(id) ?? null;
   }
 
-  async list(): Promise<Ticket[]> {
-    return [...this.tickets.values()];
+  async list(status?: TicketStatus): Promise<Ticket[]> {
+    return [...this.tickets.values()].filter((t) => !status || t.status === status);
   }
 
   /** Mismo contrato que Postgres: compare-and-set, null si no coincide. */
@@ -111,6 +132,18 @@ export class FakeTicketRepository implements TicketRepositoryPort {
     const updated = { ...ticket, status: to, updatedAt: new Date(this.now()) };
     this.tickets.set(id, updated);
     return updated;
+  }
+
+  async updateDelivery(id: string, patch: Partial<TicketDelivery>): Promise<Ticket | null> {
+    const ticket = this.tickets.get(id);
+    if (!ticket) return null;
+    const updated = { ...ticket, ...patch, updatedAt: new Date(this.now()) };
+    this.tickets.set(id, updated);
+    return updated;
+  }
+
+  async findByPullRequest(prNumber: number): Promise<Ticket | null> {
+    return [...this.tickets.values()].find((t) => t.prNumber === prNumber) ?? null;
   }
 
   async startRun(input: { ticketId: string; model: string }): Promise<{ id: string }> {
@@ -238,8 +271,14 @@ export class FakeSandbox implements SandboxPort {
   stopped = 0;
   readonly commands: string[] = [];
 
-  /** Lo que "escribio el agente". El test lo configura antes de correr. */
-  files: WorkspaceFile[] = [];
+  /**
+   * Lo que "escribio el agente". El test lo configura antes de correr.
+   *
+   * Arranca con un archivo y no vacio: desde la fase 2, una corrida sin
+   * artefacto no puede abrir PR, y los tests del ciclo de vida asumen un
+   * agente que hizo algo.
+   */
+  files: WorkspaceFile[] = [{ path: 'out.txt', content: 'ok', bytes: 2 }];
   /** Para probar que un rescate fallido no tumba la corrida. */
   exportFails?: Error;
   /** Cuantos archivos habia cuando se exporto: prueba el orden extraer->apagar. */
@@ -309,6 +348,109 @@ export class FakeSandboxJanitor implements SandboxJanitorPort {
     this.destroyed.push(containerId);
     this.managed = this.managed.filter((c) => c.containerId !== containerId);
   }
+}
+
+/**
+ * GitHub de mentira, con el mismo contrato que el adapter real: las ramas
+ * existen o no, `createOnly` sobre una existente lanza `branch_exists`, y abrir
+ * un PR dos veces sobre la misma rama es un error (GitHub devuelve 422).
+ */
+export class FakeVcs implements VcsPort {
+  /** rama -> commits, en orden. */
+  readonly branches = new Map<string, Array<{ message: string; files: CommitFile[] }>>();
+  readonly pullRequests: Array<PullRequestRef & { branch: string; title: string; body: string }> =
+    [];
+  readonly accessChecks: string[] = [];
+  private prCounter = 0;
+
+  /** Falla programada por operacion, para probar cada modo de falla. */
+  failAccess?: VcsError;
+  failCommit?: VcsError;
+  failOpenPr?: VcsError;
+
+  /** Simula ramas que ya existen en el repo y no son nuestras. */
+  seedBranch(branch: string): void {
+    this.branches.set(branch, [{ message: 'ajeno', files: [] }]);
+  }
+
+  async checkAccess(repo: string): Promise<void> {
+    this.accessChecks.push(repo);
+    if (this.failAccess) throw this.failAccess;
+  }
+
+  async commitFiles(input: {
+    repo: string;
+    branch: string;
+    base: string;
+    message: string;
+    files: CommitFile[];
+    createOnly: boolean;
+  }): Promise<{ sha: string }> {
+    if (this.failCommit) throw this.failCommit;
+    const existing = this.branches.get(input.branch);
+    if (existing && input.createOnly) {
+      throw new VcsError('branch_exists', `La rama ${input.branch} ya existe`);
+    }
+    const commits = existing ?? [];
+    commits.push({ message: input.message, files: input.files });
+    this.branches.set(input.branch, commits);
+    return { sha: `sha-${input.branch}-${commits.length}` };
+  }
+
+  async findOpenPullRequest(_repo: string, branch: string): Promise<PullRequestRef | null> {
+    const pr = this.pullRequests.find((p) => p.branch === branch);
+    return pr ? { number: pr.number, url: pr.url } : null;
+  }
+
+  async openPullRequest(input: {
+    repo: string;
+    branch: string;
+    base: string;
+    title: string;
+    body: string;
+  }): Promise<PullRequestRef> {
+    if (this.failOpenPr) throw this.failOpenPr;
+    if (this.pullRequests.some((p) => p.branch === input.branch)) {
+      throw new VcsError('unavailable', `Ya hay un PR abierto desde ${input.branch}`);
+    }
+    const number = ++this.prCounter + 40;
+    const pr = { number, url: `https://github.test/pr/${number}` };
+    this.pullRequests.push({ ...pr, branch: input.branch, title: input.title, body: input.body });
+    return pr;
+  }
+}
+
+/** CI de mentira: el test decide que checks devuelve cada PR. */
+export class FakeQualityGate implements QualityGatePort {
+  readonly checks = new Map<number, CheckRun[]>();
+  readonly fetched: number[] = [];
+  fail?: Error;
+
+  set(prNumber: number, checks: CheckRun[]): void {
+    this.checks.set(prNumber, checks);
+  }
+
+  async fetchChecks(_repo: string, prNumber: number): Promise<CheckRun[]> {
+    this.fetched.push(prNumber);
+    if (this.fail) throw this.fail;
+    return this.checks.get(prNumber) ?? [];
+  }
+}
+
+/** El flujo de PR completo contra GitHub de mentira, listo para inyectar. */
+export function deliveryFor(
+  tickets: TicketRepositoryPort,
+  vcs: VcsPort = new FakeVcs(),
+): OpenPullRequestUseCase {
+  return new OpenPullRequestUseCase(tickets, vcs, { repo: 'marcos/sandbox', base: 'main' });
+}
+
+export function green(name: string): CheckRun {
+  return { name, status: 'completed', conclusion: 'success' };
+}
+
+export function red(name: string, summary?: string): CheckRun {
+  return { name, status: 'completed', conclusion: 'failure', summary };
 }
 
 export function textResponse(text: string, tokens = { input: 10, output: 5 }): LlmResponse {

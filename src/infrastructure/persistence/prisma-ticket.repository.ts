@@ -14,7 +14,7 @@ import type {
   WorkspaceExport,
   WorkspaceFile,
 } from '../../domain/ports/sandbox.port.js';
-import type { Ticket, TicketStatus } from '../../domain/ticket.js';
+import type { Ticket, TicketDelivery, TicketStatus } from '../../domain/ticket.js';
 
 export class PrismaTicketRepository implements TicketRepositoryPort {
   constructor(private readonly prisma: PrismaClient) {}
@@ -52,6 +52,21 @@ export class PrismaTicketRepository implements TicketRepositoryPort {
     });
     if (count === 0) return null;
     return this.prisma.ticket.findUnique({ where: { id } });
+  }
+
+  async updateDelivery(id: string, patch: Partial<TicketDelivery>): Promise<Ticket | null> {
+    const { count } = await this.prisma.ticket.updateMany({ where: { id }, data: patch });
+    if (count === 0) return null;
+    return this.prisma.ticket.findUnique({ where: { id } });
+  }
+
+  async findByPullRequest(prNumber: number): Promise<Ticket | null> {
+    // findFirst y no findUnique: el numero no es unico entre repos. Hoy hay un
+    // solo repo configurado; el dia que haya varios, esto suma el repo al WHERE.
+    return this.prisma.ticket.findFirst({
+      where: { prNumber },
+      orderBy: { createdAt: 'desc' },
+    });
   }
 
   /**

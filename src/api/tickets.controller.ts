@@ -21,6 +21,10 @@ const STATUSES: readonly TicketStatus[] = [
   'BACKLOG',
   'ASSIGNED',
   'IN_PROGRESS',
+  'PR_OPEN',
+  'CHECKS_RUNNING',
+  'CHECKS_PASSED',
+  'CHANGES_REQUESTED',
   'DONE',
   'FAILED',
 ];

@@ -1,5 +1,9 @@
 import { Inject, Injectable, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { EnqueueTicketUseCase } from '../application/enqueue-ticket.use-case.js';
+import { EvaluateGatesUseCase } from '../application/evaluate-gates.use-case.js';
+import { OpenPullRequestUseCase } from '../application/open-pull-request.use-case.js';
+import { readGatesConfig, readGitHubConfig, type GitHubConfig } from '../config.js';
+import { GitHubRestAdapter } from '../infrastructure/github/github-rest.adapter.js';
 import type { QueuePort } from '../domain/ports/queue.port.js';
 import type { TicketRepositoryPort } from '../domain/ports/ticket-repository.port.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
@@ -9,8 +13,17 @@ import {
 } from '../infrastructure/persistence/prisma-client.factory.js';
 import { PrismaTicketRepository } from '../infrastructure/persistence/prisma-ticket.repository.js';
 import { BullMqQueueAdapter } from '../infrastructure/queue/bullmq-queue.adapter.js';
+import { GitHubController } from './github.controller.js';
 import { TicketsController } from './tickets.controller.js';
-import { ENQUEUE_TICKET, PRISMA, QUEUE, TICKET_REPOSITORY } from './tokens.js';
+import {
+  ENQUEUE_TICKET,
+  EVALUATE_GATES,
+  GITHUB_CONFIG,
+  OPEN_PULL_REQUEST,
+  PRISMA,
+  QUEUE,
+  TICKET_REPOSITORY,
+} from './tokens.js';
 
 /**
  * Composition root de la API.
@@ -39,7 +52,7 @@ export class QueueShutdown implements OnApplicationShutdown {
 }
 
 @Module({
-  controllers: [TicketsController],
+  controllers: [TicketsController, GitHubController],
   providers: [
     QueueShutdown,
     {
@@ -62,6 +75,34 @@ export class QueueShutdown implements OnApplicationShutdown {
       useFactory: (tickets: TicketRepositoryPort, queue: QueuePort) =>
         new EnqueueTicketUseCase(tickets, queue),
       inject: [TICKET_REPOSITORY, QUEUE],
+    },
+    // GitHub es opcional para la API: sin token, sus rutas responden 503 y el
+    // resto sigue andando. Por eso estos providers pueden valer null.
+    { provide: GITHUB_CONFIG, useFactory: () => readGitHubConfig() },
+    {
+      provide: OPEN_PULL_REQUEST,
+      useFactory: (tickets: TicketRepositoryPort, github: GitHubConfig | null) =>
+        github
+          ? new OpenPullRequestUseCase(tickets, new GitHubRestAdapter({ token: github.token }), {
+              repo: github.repo,
+              base: github.base,
+              secrets: [github.token],
+            })
+          : null,
+      inject: [TICKET_REPOSITORY, GITHUB_CONFIG],
+    },
+    {
+      provide: EVALUATE_GATES,
+      useFactory: (tickets: TicketRepositoryPort, queue: QueuePort, github: GitHubConfig | null) =>
+        github
+          ? new EvaluateGatesUseCase(
+              tickets,
+              new GitHubRestAdapter({ token: github.token }),
+              queue,
+              readGatesConfig(github.repo),
+            )
+          : null,
+      inject: [TICKET_REPOSITORY, QUEUE, GITHUB_CONFIG],
     },
   ],
 })

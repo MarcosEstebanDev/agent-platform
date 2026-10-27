@@ -1,11 +1,14 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import type { LlmPort, LlmResponse } from '../domain/ports/llm.port.js';
+import { VcsError } from '../domain/ports/vcs.port.js';
 import {
+  deliveryFor,
   FakeLlm,
   FakeSandbox,
   FakeSandboxFactory,
   FakeTicketRepository,
+  FakeVcs,
   textResponse,
   toolResponse,
 } from './fakes.js';
@@ -26,17 +29,19 @@ function build(
   const tickets = new FakeTicketRepository();
   const llm = new FakeLlm(scripted);
   const sandboxes = new FakeSandboxFactory(prepare);
+  const vcs = new FakeVcs();
   return {
     tickets,
     llm,
     sandboxes,
-    useCase: new RunTicketUseCase(tickets, llm, sandboxes),
+    vcs,
+    useCase: new RunTicketUseCase(tickets, llm, sandboxes, deliveryFor(tickets, vcs)),
   };
 }
 
 // ─── Ciclo de vida ──────────────────────────────────────────────────────────
 
-test('camino feliz: BACKLOG termina en DONE pasando por ASSIGNED', async () => {
+test('camino feliz: BACKLOG termina en PR_OPEN pasando por ASSIGNED', async () => {
   const { tickets, useCase } = build([toolResponse('echo hola'), textResponse('listo')]);
   tickets.seed('BACKLOG');
 
@@ -44,7 +49,7 @@ test('camino feliz: BACKLOG termina en DONE pasando por ASSIGNED', async () => {
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.ticket.status, 'DONE');
+  assert.equal(result.ticket.status, 'PR_OPEN');
   assert.equal(result.summary.outcome, 'completed');
 });
 
@@ -166,7 +171,7 @@ test('un fallo al persistir un evento no mata la corrida', async () => {
 
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.equal(result.ticket.status, 'DONE', 'el log es best-effort, no bloqueante');
+  assert.equal(result.ticket.status, 'PR_OPEN', 'el log es best-effort, no bloqueante');
 });
 
 // ─── Fase 1b: latido y presupuestos ─────────────────────────────────────────
@@ -188,6 +193,7 @@ test('reporta latido mientras la corrida esta en curso', async () => {
     tickets,
     new SlowLlm(60),
     new FakeSandboxFactory(),
+    deliveryFor(tickets),
     {},
     5, // heartbeat cada 5 ms
   );
@@ -207,6 +213,7 @@ test('el latido se corta al terminar: no sigue latiendo una corrida cerrada', as
     tickets,
     new FakeLlm([textResponse('listo')]),
     new FakeSandboxFactory(),
+    deliveryFor(tickets),
     {},
     5,
   );
@@ -226,6 +233,7 @@ test('agotar el presupuesto de tokens deja el ticket en FAILED con el motivo', a
     // Una sola iteracion que consume mas que todo el presupuesto.
     new FakeLlm([toolResponse('echo', { input: 60_000, output: 60_000 })]),
     new FakeSandboxFactory(),
+    deliveryFor(tickets),
     { maxTokens: 100_000 },
   );
 
@@ -260,6 +268,7 @@ test('el arranque del sandbox descuenta del presupuesto de tiempo', async () => 
     tickets,
     new FakeLlm([textResponse('listo')]),
     lentos,
+    deliveryFor(tickets),
     { maxWallClockMs: 50 },
   );
 
@@ -278,6 +287,7 @@ test('el ultimo evento persistido dice por que se corto', async () => {
     tickets,
     new FakeLlm([toolResponse('echo', { input: 60_000, output: 60_000 })]),
     new FakeSandboxFactory(),
+    deliveryFor(tickets),
     { maxTokens: 100_000 },
   );
 
@@ -363,9 +373,12 @@ test('un rescate fallido NO convierte una corrida exitosa en falla', async () =>
   if (!result.ok) return;
 
   // El agente resolvio la tarea: que falle sacar los archivos no invalida
-  // lo que hizo.
-  assert.equal(result.ticket.status, 'DONE');
+  // lo que hizo, y la corrida cierra como completada.
   assert.equal(result.summary.outcome, 'completed');
+  // Pero sin artefacto no hay PR posible, y eso lo decide el flujo del PR,
+  // no el rescate (ADR 0010): el ticket termina en FAILED con el motivo.
+  assert.equal(result.ticket.status, 'FAILED');
+  assert.match(result.ticket.statusReason ?? '', /artefacto/i);
   // Pero tampoco se calla: un PR vacio sin explicacion es peor que uno que
   // dice por que esta vacio.
   assert.match(result.artifact.error ?? '', /docker exec murio/);
@@ -402,6 +415,7 @@ test('si el sandbox nunca arranco, no se intenta rescatar nada', async () => {
     tickets,
     new FakeLlm([textResponse('listo')]),
     sandboxes,
+    deliveryFor(tickets),
   ).execute('T-1');
 
   assert.equal(result.ok, true);
@@ -422,4 +436,93 @@ test('el sandbox se crea con el id de la corrida', async () => {
   // Sin esta identidad, un container que sobrevive a su worker es
   // indistinguible de uno que esta trabajando.
   assert.equal(sandboxes.contexts[0]!.runId, result.runId);
+});
+
+// ─── Entrega: del agente al PR (fases 2 y 3) ────────────────────────────────
+
+test('una corrida completada termina en PR_OPEN, nunca en DONE', async () => {
+  // ADR 0007: el agente no da el veredicto. DONE lo deciden los checks.
+  const { tickets, vcs, useCase } = build([textResponse('listo')]);
+  tickets.seed('BACKLOG');
+
+  const result = await useCase.execute('T-1');
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.ticket.status, 'PR_OPEN');
+  assert.equal(vcs.pullRequests.length, 1);
+  assert.ok(vcs.branches.has('feature/TICKET-T-1'));
+});
+
+test('una corrida que no termina no abre PR', async () => {
+  const { tickets, vcs, useCase } = build([new Error('LLM caido')]);
+  tickets.seed('BACKLOG');
+
+  const result = await useCase.execute('T-1');
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.ticket.status, 'FAILED');
+  assert.equal(vcs.branches.size, 0);
+});
+
+test('repo inaccesible: FAILED antes de gastar tokens', async () => {
+  const { tickets, llm, sandboxes, vcs, useCase } = build([textResponse('listo')]);
+  tickets.seed('BACKLOG');
+  vcs.failAccess = new VcsError('not_found', 'No existe marcos/sandbox o el token no lo ve');
+
+  const result = await useCase.execute('T-1');
+
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.equal(result.reason, 'delivery_unavailable');
+  assert.equal(llm.calls, 0, 'ni un token');
+  assert.equal(sandboxes.created.length, 0, 'ni un container');
+  const ticket = await tickets.findById('T-1');
+  assert.equal(ticket?.status, 'FAILED');
+  assert.match(ticket?.statusReason ?? '', /No existe marcos\/sandbox/);
+});
+
+test('el feedback de los checks fallidos llega al task del reintento', async () => {
+  const seen: string[] = [];
+  const tickets = new FakeTicketRepository();
+  const llm: LlmPort = {
+    modelName: 'spy',
+    async complete(messages) {
+      seen.push(JSON.stringify(messages));
+      return textResponse('listo');
+    },
+  };
+  tickets.seed('ASSIGNED', 'T-1', {
+    gateFeedback: 'Intento anterior (PR #42) falló:\n  ✗ test — Expected 401',
+  });
+
+  await new RunTicketUseCase(
+    tickets,
+    llm,
+    new FakeSandboxFactory(),
+    deliveryFor(tickets),
+  ).execute('T-1');
+
+  assert.match(seen[0] ?? '', /hacer algo/, 'el task original sigue');
+  assert.match(seen[0] ?? '', /Intento anterior \(PR #42\)/);
+});
+
+test('el ciclo de correccion suma un commit a la misma rama y reusa el PR', async () => {
+  const { tickets, vcs, useCase } = build([textResponse('listo'), textResponse('listo')]);
+  tickets.seed('BACKLOG');
+  await useCase.execute('T-1');
+
+  // Lo que hace EvaluateGatesUseCase cuando CI da rojo.
+  await tickets.transition('T-1', 'PR_OPEN', 'CHECKS_RUNNING');
+  await tickets.transition('T-1', 'CHECKS_RUNNING', 'CHANGES_REQUESTED');
+  await tickets.transition('T-1', 'CHANGES_REQUESTED', 'ASSIGNED');
+
+  const result = await useCase.execute('T-1');
+
+  assert.equal(result.ok, true);
+  if (!result.ok) return;
+  assert.equal(result.ticket.status, 'PR_OPEN');
+  assert.equal(vcs.branches.get('feature/TICKET-T-1')!.length, 2, 'dos commits, una rama');
+  assert.equal(vcs.pullRequests.length, 1, 'el mismo PR');
 });

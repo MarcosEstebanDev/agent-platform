@@ -1,4 +1,4 @@
-import type { Ticket, TicketStatus } from '../ticket.js';
+import type { Ticket, TicketDelivery, TicketStatus } from '../ticket.js';
 import type { AgentEvent } from '../agent-runner.js';
 import type { WorkspaceExport } from './sandbox.port.js';
 
@@ -81,6 +81,18 @@ export interface TicketRepositoryPort {
     expectedFrom: TicketStatus,
     to: TicketStatus,
   ): Promise<Ticket | null>;
+
+  /**
+   * Actualiza los campos de entrega (rama, PR, gates) SIN tocar el estado.
+   *
+   * Va separado de `transition` a proposito: el estado cambia por
+   * compare-and-set y estos campos no compiten por nada. Mezclarlos haria que
+   * guardar la rama dependiera de ganar una carrera que no existe.
+   */
+  updateDelivery(id: string, patch: Partial<TicketDelivery>): Promise<Ticket | null>;
+
+  /** El ticket dueño de un PR. Lo usa el webhook, que sólo conoce el número. */
+  findByPullRequest(prNumber: number): Promise<Ticket | null>;
 
   startRun(input: { ticketId: string; model: string }): Promise<{ id: string }>;
   appendEvent(runId: string, seq: number, event: AgentEvent): Promise<void>;

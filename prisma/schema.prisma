@@ -15,6 +15,10 @@ enum TicketStatus {
   BACKLOG
   ASSIGNED
   IN_PROGRESS
+  PR_OPEN
+  CHECKS_RUNNING
+  CHECKS_PASSED
+  CHANGES_REQUESTED
   DONE
   FAILED
 }
@@ -25,12 +29,29 @@ model Ticket {
   /// La instrucción que recibe el agente.
   task      String
   status    TicketStatus @default(BACKLOG)
+
+  /// Rama donde vive el trabajo. Se guarda apenas se pushea, antes del PR:
+  /// si el PR falla, reintentar no reejecuta al agente.
+  branch          String?
+  prNumber        Int?      @map("pr_number")
+  prUrl           String?   @map("pr_url")
+  /// Cuantas veces los checks rechazaron el PR. Tope: 3 (spec 004).
+  gateAttempts    Int       @default(0) @map("gate_attempts")
+  /// Lo que fallo en el ultimo intento. Se suma al task del reintento.
+  gateFeedback    String?   @map("gate_feedback")
+  /// Desde cuando se esperan los checks. Mide el timeout de 30 min.
+  checksStartedAt DateTime? @map("checks_started_at")
+  /// Por que el ticket esta donde esta, cuando no es obvio.
+  statusReason    String?   @map("status_reason")
+
   createdAt DateTime     @default(now()) @map("created_at")
   updatedAt DateTime     @updatedAt @map("updated_at")
 
   runs AgentRun[]
 
   @@index([status])
+  /// El webhook de GitHub solo conoce el numero de PR.
+  @@index([prNumber])
   @@map("tickets")
 }
 

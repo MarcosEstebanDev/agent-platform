@@ -11,7 +11,11 @@ import type {
   AgentRunSummary,
   TicketRepositoryPort,
 } from '../domain/ports/ticket-repository.port.js';
-import type { Ticket } from '../domain/ticket.js';
+import { composeTask, type Ticket } from '../domain/ticket.js';
+import type {
+  OpenPullRequestResult,
+  OpenPullRequestUseCase,
+} from './open-pull-request.use-case.js';
 
 /** Qué sobrevivió al sandbox. Se informa aunque la extracción haya fallado. */
 export interface ArtifactOutcome {
@@ -28,8 +32,18 @@ export type RunTicketResult =
       runId: string;
       summary: AgentRunSummary;
       artifact: ArtifactOutcome;
+      /** Que paso al entregar el trabajo. Solo si la corrida termino bien. */
+      delivery?: OpenPullRequestResult;
     }
-  | { ok: false; reason: 'not_found' | 'already_taken' | 'invalid_status'; detail: string };
+  | {
+      ok: false;
+      /**
+       * `delivery_unavailable`: el repo destino no es alcanzable. Se detecta
+       * antes de gastar tokens y el ticket queda en FAILED con el motivo.
+       */
+      reason: 'not_found' | 'already_taken' | 'invalid_status' | 'delivery_unavailable';
+      detail: string;
+    };
 
 /**
  * Ejecuta un ticket de punta a punta y deja traza de todo.
@@ -43,6 +57,8 @@ export class RunTicketUseCase {
     private readonly tickets: TicketRepositoryPort,
     private readonly llm: LlmPort,
     private readonly sandboxes: SandboxFactoryPort,
+    /** Lleva el trabajo a un PR. Desde la fase 2, el agente termina ahi. */
+    private readonly delivery: OpenPullRequestUseCase,
     private readonly budget: Partial<AgentBudget> = {},
     /** Cada cuanto se reporta el latido. Menos de la mitad del umbral del reaper. */
     private readonly heartbeatMs = 30_000,
@@ -82,6 +98,17 @@ export class RunTicketUseCase {
     const claimed = await this.tickets.transition(current.id, 'ASSIGNED', 'IN_PROGRESS');
     if (!claimed) {
       return { ok: false, reason: 'already_taken', detail: 'Otro worker tomó el ticket' };
+    }
+
+    // Antes de gastar un token: si el repo destino no es alcanzable, todo lo
+    // que haga el agente se va a perder igual (spec 003, "clonar falla").
+    try {
+      await this.delivery.preflight();
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await this.tickets.updateDelivery(claimed.id, { statusReason: detail });
+      await this.tickets.transition(claimed.id, 'IN_PROGRESS', 'FAILED');
+      return { ok: false, reason: 'delivery_unavailable', detail };
     }
 
     const run = await this.tickets.startRun({
@@ -140,7 +167,7 @@ export class RunTicketUseCase {
       const result = await new AgentRunner(this.llm, sandbox, {
         ...this.budget,
         maxWallClockMs: restante,
-      }).run(claimed.task, (event) => void persist(event));
+      }).run(composeTask(claimed.task, claimed.gateFeedback), (event) => void persist(event));
       summary = {
         outcome: result.reason,
         iterations: result.iterations,
@@ -173,18 +200,24 @@ export class RunTicketUseCase {
 
     await this.tickets.finishRun(run.id, summary);
 
-    // FASE 1: el veredicto sale del autoreporte del agente.
-    // FASE 3: sale de los checks del PR, y esta línea cambia.
-    const finalStatus = summary.outcome === 'completed' ? 'DONE' : 'FAILED';
-    const finished = await this.tickets.transition(claimed.id, 'IN_PROGRESS', finalStatus);
+    // Desde la fase 3 el agente no da el veredicto: una corrida completada
+    // termina en un PR, y DONE lo deciden los checks de CI sobre ese PR
+    // (EvaluateGatesUseCase, ADR 0007). Lo que si se decide aca es que una
+    // corrida que no termino no merece PR.
+    if (summary.outcome !== 'completed') {
+      const failed = await this.tickets.transition(claimed.id, 'IN_PROGRESS', 'FAILED');
+      return {
+        ok: true,
+        ticket: failed ?? { ...claimed, status: 'FAILED' },
+        runId: run.id,
+        summary,
+        artifact,
+      };
+    }
 
-    return {
-      ok: true,
-      ticket: finished ?? { ...claimed, status: finalStatus },
-      runId: run.id,
-      summary,
-      artifact,
-    };
+    const delivery = await this.delivery.execute(claimed.id, run.id);
+    const latest = (await this.tickets.findById(claimed.id)) ?? claimed;
+    return { ok: true, ticket: latest, runId: run.id, summary, artifact, delivery };
   }
 
   /**
@@ -195,7 +228,7 @@ export class RunTicketUseCase {
    * en la traza, porque un PR vacio sin explicacion es peor que uno que dice
    * por que esta vacio.
    *
-   * Cuando la fase 2 abra Pull Requests esto cambia de peso: sin artefacto no
+   * Desde la fase 2 esto cambia de peso: sin artefacto no
    * hay PR posible, y ahi el que decide que hacer es el flujo del PR, no este
    * metodo.
    */

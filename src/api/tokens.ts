@@ -9,3 +9,6 @@ export const PRISMA = Symbol('PRISMA');
 export const TICKET_REPOSITORY = Symbol('TICKET_REPOSITORY');
 export const QUEUE = Symbol('QUEUE');
 export const ENQUEUE_TICKET = Symbol('ENQUEUE_TICKET');
+export const GITHUB_CONFIG = Symbol('GITHUB_CONFIG');
+export const OPEN_PULL_REQUEST = Symbol('OPEN_PULL_REQUEST');
+export const EVALUATE_GATES = Symbol('EVALUATE_GATES');

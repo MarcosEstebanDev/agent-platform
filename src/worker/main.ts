@@ -1,4 +1,6 @@
 import { Worker, type Job } from 'bullmq';
+import { EvaluateGatesUseCase } from '../application/evaluate-gates.use-case.js';
+import { OpenPullRequestUseCase } from '../application/open-pull-request.use-case.js';
 import { ReapStaleRunsUseCase } from '../application/reap-stale-runs.use-case.js';
 import { RunTicketUseCase } from '../application/run-ticket.use-case.js';
 import { SweepOrphanSandboxesUseCase } from '../application/sweep-orphan-sandboxes.use-case.js';
@@ -7,8 +9,11 @@ import {
   buildSandboxFactory,
   readBudget,
   readExportOptions,
+  readGatesConfig,
+  readGitHubConfig,
   readInt,
 } from '../config.js';
+import { GitHubRestAdapter } from '../infrastructure/github/github-rest.adapter.js';
 import {
   createPrismaClient,
   requireDatabaseUrl,
@@ -16,6 +21,7 @@ import {
 import { PrismaTicketRepository } from '../infrastructure/persistence/prisma-ticket.repository.js';
 import { DockerSandboxJanitor } from '../infrastructure/sandbox/docker-sandbox.janitor.js';
 import {
+  BullMqQueueAdapter,
   redisConnection,
   RUNS_QUEUE,
   type RunTicketJobData,
@@ -42,14 +48,36 @@ const staleAfterMs = readInt('REAPER_STALE_AFTER_MS') ?? 90_000;
 // entre marcar la corrida terminada y que stop() alcance a destruirlo.
 const orphanGraceMs = readInt('SANDBOX_ORPHAN_GRACE_MS') ?? 60_000;
 
+// Respaldo del webhook (spec 004): los webhooks se pierden.
+const gatesPollMs = readInt('GATES_POLL_INTERVAL_MS') ?? 60_000;
+
+// Desde la fase 2 el agente termina en un PR. Sin GitHub configurado no hay
+// donde entregar el trabajo, y correr al agente seria gastar tokens para nada.
+const github = readGitHubConfig();
+if (!github) {
+  console.error(
+    '✗ Falta GITHUB_TOKEN en .env (y GITHUB_REPO).\n' +
+      '  El worker entrega cada corrida como Pull Request; sin repo destino no arranca.\n' +
+      '  Ver .env.example, seccion GitHub.',
+  );
+  process.exit(1);
+}
+
 const prisma = createPrismaClient(requireDatabaseUrl());
 const tickets = new PrismaTicketRepository(prisma);
 const llm = buildLlm();
+const gitHub = new GitHubRestAdapter({ token: github.token });
 
+const delivery = new OpenPullRequestUseCase(tickets, gitHub, {
+  repo: github.repo,
+  base: github.base,
+  secrets: [github.token],
+});
 const runTicket = new RunTicketUseCase(
   tickets,
   llm,
   buildSandboxFactory(),
+  delivery,
   readBudget(),
   undefined,
   readExportOptions(),
@@ -60,6 +88,10 @@ const janitor = new SweepOrphanSandboxesUseCase(
   new DockerSandboxJanitor(),
   orphanGraceMs,
 );
+// Cola propia para reencolar los rechazos de CI: el ciclo de correccion
+// vuelve a pasar por la cola, igual que cualquier corrida.
+const requeue = new BullMqQueueAdapter(redisUrl);
+const gates = new EvaluateGatesUseCase(tickets, gitHub, requeue, readGatesConfig(github.repo));
 
 // La conexion se construye aca y se cierra aca: BullMQ no cierra las que no creo.
 const connection = redisConnection(redisUrl);
@@ -76,8 +108,9 @@ const worker = new Worker<RunTicketJobData>(
     });
 
     if (!result.ok) {
-      // Estos NO son fallas del job: el ticket no existe, o se lo llevo otro
-      // worker. Reintentar no cambiaria nada, asi que el job termina bien.
+      // Estos NO son fallas del job: el ticket no existe, se lo llevo otro
+      // worker, o el repo destino es inaccesible (el ticket ya quedo FAILED
+      // con el motivo). Reintentar no cambiaria nada, asi que el job termina bien.
       console.log(`  ! ${result.reason}: ${result.detail}`);
       return { skipped: result.reason };
     }
@@ -93,6 +126,11 @@ const worker = new Worker<RunTicketJobData>(
         `  ${result.artifact.files} archivo(s) rescatado(s), ` +
           `${result.artifact.bytes} bytes${result.artifact.truncated ? ' (truncado)' : ''}`,
       );
+    }
+    if (result.delivery?.ok) {
+      console.log(`  PR #${result.delivery.pullRequest.number}: ${result.delivery.pullRequest.url}`);
+    } else if (result.delivery) {
+      console.warn(`  ! sin PR (${result.delivery.reason}): ${result.delivery.detail}`);
     }
     return { status: result.ticket.status, runId: result.runId };
   },
@@ -135,18 +173,40 @@ const sweep = setInterval(() => {
     });
 }, reaperIntervalMs);
 
+// El poller de los gates vive en el worker por la misma razon que el reaper:
+// la API puede tener replicas y el barrido no necesita correr N veces. Si
+// igual corre dos veces, cada paso es compare-and-set y el segundo no hace nada.
+const gatesPoll = setInterval(() => {
+  void gates
+    .evaluatePending()
+    .then((results) => {
+      for (const r of results) {
+        if (r.outcome === 'skipped' || r.outcome === 'waiting') continue;
+        const log = r.outcome === 'error' ? console.error : console.log;
+        log(`[gates] ticket ${r.ticketId}: ${r.outcome}${r.detail ? ` (${r.detail})` : ''}`);
+      }
+    })
+    .catch((err: unknown) => {
+      console.error('[gates] fallo el barrido:', err instanceof Error ? err.message : err);
+    });
+}, gatesPollMs);
+
 console.log(`Worker escuchando la cola "${RUNS_QUEUE}"`);
 console.log(`  redis:        ${redisUrl}`);
 console.log(`  modelo:       ${llm.modelName}`);
 console.log(`  concurrencia: ${concurrency}`);
-console.log(`  reaper:       cada ${reaperIntervalMs / 1000}s, umbral ${staleAfterMs / 1000}s\n`);
+console.log(`  reaper:       cada ${reaperIntervalMs / 1000}s, umbral ${staleAfterMs / 1000}s`);
+console.log(`  repo:         ${github.repo} (base ${github.base})`);
+console.log(`  gates:        poller cada ${gatesPollMs / 1000}s\n`);
 
 async function shutdown(signal: string): Promise<void> {
   console.log(`\n${signal}: cerrando...`);
   clearInterval(sweep);
+  clearInterval(gatesPoll);
   // `close()` espera a que terminen los jobs en curso. Cortar al medio dejaria
   // corridas sin cerrar, que es justamente lo que el reaper tiene que limpiar.
   await worker.close();
+  await requeue.close();
   await connection.quit();
   await prisma.$disconnect();
   process.exit(0);
