@@ -214,7 +214,17 @@ compatible con OpenAI sirve — ver `.env.example`.
 ## Verificación real (fases 2 y 3)
 
 Las fases 2 y 3 están verificadas contra dobles. Falta la corrida de punta a
-punta contra GitHub, que necesita un repo de prueba y un token:
+punta contra GitHub, que necesita un repo de prueba y un token.
+
+**Estado al 2026-11-07: infra verificada, GitHub pendiente.** Contra Docker
+real: Postgres y Redis del compose arriba, las dos migraciones que faltaban
+(`rescate_del_workspace` y `pull_requests_y_gates`) aplicadas con
+`prisma migrate deploy`, 140 tests y `typecheck` en verde. La API arranca sin
+token, crea tickets con las columnas nuevas (`branch`, `prNumber`,
+`gateAttempts`…) y responde 503 en `/tickets/:id/pull-request` y
+`/webhooks/github`; el worker se niega a arrancar. Los pasos 4 a 7 **no se
+corrieron**: `.env` todavía no tiene `GITHUB_TOKEN` ni `GITHUB_REPO` reales
+(quedaron los placeholders de `.env.example`). La key del LLM sí está.
 
 1. **Repo de prueba.** Crear uno en GitHub (privado sirve) con al menos un
    commit en `main` y un workflow de Actions que corra los tests, por ejemplo
